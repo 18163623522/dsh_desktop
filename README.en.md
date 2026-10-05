@@ -47,7 +47,7 @@ Ships the full dsh runtime and official plugins — no Node.js install required,
 
 ## 📸 App Preview
 
-![DSH Desktop UI](https://cdn.jsdelivr.net/gh/myYangyunfan/dsh_desktop@main/docs/showcase.png)
+![DSH Desktop UI](https://cdn.jsdelivr.net/gh/myYangyunfan/dsh_desktop@5c673d6/docs/showcase.png)
 
 **Vanilla `dsh web`** vs **DSH Desktop**:
 
@@ -110,7 +110,7 @@ Gitee caps files at 100 MB, so Electron installers are split into parts (`.part1
 
 Questions, feedback, or just want to chat with other users? Join our QQ group (**926561802**):
 
-![QQ Group](https://cdn.jsdelivr.net/gh/myYangyunfan/dsh_desktop@main/docs/qq-group-qr.png)
+![QQ Group](https://cdn.jsdelivr.net/gh/myYangyunfan/dsh_desktop@5c673d6/docs/qq-group-qr.png)
 
 ## 🛠 Build from Source
 

@@ -11,9 +11,7 @@
 | `dsh-desktop/scripts/` | 构建期补丁、自愈模块；测试统一放 `scripts/test/` |
 | `dsh-desktop/assets/plugins/` | 内置 Cordis 插件包 |
 | `dsh-desktop/assets/agent-presets/` | 内置 Agent 预设 |
-| `.github/workflows/release.yml` | 三平台五 job 发布流水线（tag 触发） |
-| `landing/` | 官网落地页 |
-| `openclaw-dsh-bridge/` | 微信 ClawBot ↔ DSH 桥接插件 |
+| `.github/workflows/tauri-release.yml` | Tauri 三平台发布流水线（tag 触发） |
 
 ## 开发环境
 

@@ -16,7 +16,6 @@ Node 逻辑仍是活代码（Tauri sidecar 直接复用，零重写）。主平�
 | `dsh-desktop/` | 内核侧 Node 逻辑：构建期补丁、自愈、插件同步、余额链、`assets/plugins/`、`assets/agent-presets/`、`vendor/dsh-kernel/`（pin 的离线内核 tgz，**必须入库**） |
 | `dsh-desktop/scripts/test/` | 全部 Node 测试（186 个 `*.test.js/.mjs`，另有 `fixtures/`、`ta16-snapshots/`、mock server），单测唯一去处 |
 | `.github/workflows/` | `ci.yml`（PR 门禁）、`tauri-release.yml`（tag 发版，唯一发布入口）、`release.yml`（退役 Electron 线，全部 `if: false`） |
-| `landing/` `openclaw-dsh-bridge/` `docs/` `research/` | 官网页、微信桥接插件、仓库级配图、调研稿 |
 
 ## 常用命令
 

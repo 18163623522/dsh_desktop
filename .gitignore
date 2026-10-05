@@ -14,9 +14,6 @@ dsh-desktop/vendor/npm/
 .dev-data/
 .update-test/
 
-# openclaw-dsh-bridge (微信桥接插件) build artifacts
-openclaw-dsh-bridge/node_modules/
-openclaw-dsh-bridge/dist/
 
 # Logs
 *.log
