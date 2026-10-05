@@ -7,7 +7,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { validatePin, validateVendorDir, loadPin } = require('../compat/validate-pin.js');
+const { validatePin, validateVendorDir, loadPin, isRehomedTarball } = require('../compat/validate-pin.js');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -62,6 +62,36 @@ test('validateVendorDir：版本混装防线', () => {
   e = validateVendorDir(ROOT, p);
   assert.ok(e.some((m) => /版本混装防线/.test(m)), `混装须报错: ${JSON.stringify(e)}`);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('validateVendorDir：收编族（独立版本线）不误判混装（0.6.5 回归）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'compat-pin-rehomed-'));
+  const p = JSON.parse(JSON.stringify(validPin()));
+  p.kernel.vendorDir = dir;
+  const want = p.kernel.packageVersion;
+  fs.writeFileSync(path.join(dir, `deepseek-ai-dsh-${want}.tgz`), 'x');
+  fs.writeFileSync(path.join(dir, 'deepseek-ai-cordis-4.0.2.tgz'), 'x');
+  fs.writeFileSync(path.join(dir, 'deepseek-ai-cordis-plugin-loader-1.0.3.tgz'), 'x');
+  fs.writeFileSync(path.join(dir, 'deepseek-ai-cosmokit-1.8.3.tgz'), 'x');
+  fs.writeFileSync(path.join(dir, 'deepseek-ai-schemastery-3.18.2.tgz'), 'x');
+  fs.writeFileSync(path.join(dir, 'deepseek-ai-node-addon-system-darwin-x64-0.1.2.tgz'), 'x');
+  assert.deepEqual(validateVendorDir(ROOT, p), [], '完整 vendor（含收编族）必须 PASS');
+  // 未知家族不在豁免清单内 → 仍 fail-closed（防止随意放宽）
+  fs.writeFileSync(path.join(dir, 'deepseek-ai-mystery-9.9.9.tgz'), 'x');
+  const e = validateVendorDir(ROOT, p);
+  assert.ok(e.some((m) => /版本混装防线/.test(m)), '未知家族不得豁免');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('isRehomedTarball：四族前缀识别（含子包/平台包），内核家族拒绝', () => {
+  assert.equal(isRehomedTarball('deepseek-ai-cordis-4.0.2.tgz'), true);
+  assert.equal(isRehomedTarball('deepseek-ai-cordis-plugin-hmr-1.0.17.tgz'), true);
+  assert.equal(isRehomedTarball('deepseek-ai-cosmokit-1.8.3.tgz'), true);
+  assert.equal(isRehomedTarball('deepseek-ai-schemastery-3.18.2.tgz'), true);
+  assert.equal(isRehomedTarball('deepseek-ai-node-addon-system-0.1.2.tgz'), true);
+  assert.equal(isRehomedTarball('deepseek-ai-node-addon-system-linux-arm64-0.1.2.tgz'), true);
+  assert.equal(isRehomedTarball('deepseek-ai-dsh-agent-0.1.6-alpha.1.tgz'), false);
+  assert.equal(isRehomedTarball('deepseek-ai-dsh-0.1.2-alpha.4.tgz'), false);
 });
 
 test('loadPin：pin 文件缺失报 fs 错（fail-closed）', () => {

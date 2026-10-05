@@ -81,6 +81,41 @@ test('干净（全匹配）→ no-op 零改动', (t) => {
   assert.equal(fs.readdirSync(vdir).filter((f) => f.endsWith('.tgz')).length, 2);
 });
 
+test('收编族（独立版本线）在场 → 绝不误剪，validate PASS（0.6.5 回归）', (t) => {
+  const { root, vdir } = makeAppDir(t, [
+    'deepseek-ai-dsh-' + WANT + '.tgz',
+    'deepseek-ai-cordis-4.0.2.tgz',
+    'deepseek-ai-cordis-plugin-loader-1.0.3.tgz',
+    'deepseek-ai-cosmokit-1.8.3.tgz',
+    'deepseek-ai-node-addon-system-darwin-x64-0.1.2.tgz',
+  ]);
+  const r = healVendorStaleKernels({ appDir: root, log: () => {} });
+  assert.equal(r.changed, false, '收编族不得触发剪除');
+  assert.equal(r.pruned.length, 0);
+  const names = fs.readdirSync(vdir).filter((f) => f.endsWith('.tgz')).sort();
+  assert.equal(names.length, 5, '5 个文件全保留');
+  assert.ok(names.includes('deepseek-ai-cordis-4.0.2.tgz'), '收编族仍在 vendor');
+  assert.equal(runValidate(root).ok, true, '完整 vendor（含收编族）validate 应 PASS');
+});
+
+test('隔离区中的收编族被救回；真陈旧件不救（0.6.5 回归）', (t) => {
+  const { root, vdir } = makeAppDir(t, ['deepseek-ai-dsh-' + WANT + '.tgz']);
+  const qdir = path.join(path.dirname(vdir), QUARANTINE_DIR_NAME);
+  fs.mkdirSync(qdir, { recursive: true });
+  fs.writeFileSync(path.join(qdir, 'deepseek-ai-cordis-4.0.2.tgz'), 'payload');
+  fs.writeFileSync(path.join(qdir, 'deepseek-ai-cosmokit-1.8.3.tgz'), 'payload');
+  fs.writeFileSync(path.join(qdir, 'deepseek-ai-dsh-' + STALE + '.tgz'), 'payload');
+
+  const r = healVendorStaleKernels({ appDir: root, log: () => {} });
+  assert.equal(r.changed, true, '救回即视为发生修复');
+  assert.equal(r.rescued.length, 2, '两个收编族救回');
+  assert.ok(fs.existsSync(path.join(vdir, 'deepseek-ai-cordis-4.0.2.tgz')), 'cordis 回到 vendor');
+  assert.ok(fs.existsSync(path.join(vdir, 'deepseek-ai-cosmokit-1.8.3.tgz')), 'cosmokit 回到 vendor');
+  assert.ok(!fs.existsSync(path.join(vdir, 'deepseek-ai-dsh-' + STALE + '.tgz')), '真陈旧件不进 vendor');
+  assert.ok(!fs.existsSync(qdir), '救回后 vendor 无陈旧件 → 空隔离目录被清理');
+  assert.equal(runValidate(root).ok, true, '救回后 validate 应 PASS');
+});
+
 test('全是陈旧件（无匹配版本）→ 绝不剪，保留文件', (t) => {
   const { root, vdir } = makeAppDir(t, ['a-' + STALE + '.tgz', 'b-' + STALE + '.tgz']);
   const r = healVendorStaleKernels({ appDir: root, log: () => {} });

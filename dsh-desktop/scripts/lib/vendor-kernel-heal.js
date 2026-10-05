@@ -6,8 +6,8 @@
 // 问题（0.6.1 alpha.5 覆盖安装实测）：NSIS 覆盖安装只做「增/覆盖」不做「删」——
 // 旧安装 vendor/dsh-kernel 里 242 个 alpha.4 tgz 不会被清除，与新的 242 个
 // alpha.5 叠成 484（版本混装）。`scripts/compat/validate-pin.js` 的「版本混装
-// 防线」按 `f.includes(pin.kernel.packageVersion)` 判定，任何非 pin 版本 tgz 视
-// 为不一致 → boot 链 compat-pin 步 fail-closed 拒启 → 崩溃环 → 恢复页。
+// 防线」当时按 `f.includes(pin.kernel.packageVersion)` 一刀切判定 → boot 链
+// compat-pin 步 fail-closed 拒启 → 崩溃环 → 恢复页。
 // 用户看不到清晰指引（只知道「版本仍 0.6.0、boot 起不来」），实际是安装器没
 // 有 purge 陈旧内核 tarball 的语义。
 //
@@ -17,6 +17,10 @@
 // compat-pin 只看当前 pin 版本 tarball → 校验通过 → boot 继续。
 //
 // 宁漏勿误原则：
+//   - 收编族（cordis/cosmokit/schemastery/node-addon-system）版本线独立于 kernel
+//     pin，**绝不视为陈旧件**（0.6.5 实测教训：旧版本按 `includes(want)` 一刀切，
+//     把 14 个收编族 tarball 判成陈旧件隔离、下一轮又整目录清掉——vendor 被自家
+//     自愈掏空）；隔离区里已有收编族则先救回 vendor 再继续；
 //   - kernel-pin.json 不在位 / 无 packageVersion / 无 vendorDir → 不修（下次
 //     boot 再试；半安装 / 未来 pin schema 演进时不炸）；
 //   - vendor 目录缺失 / 无 tgz → 不修（不是本模块的职责，交给 compat-pin 的
@@ -35,7 +39,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { loadPin } = require('../compat/validate-pin');
+const { loadPin, isRehomedTarball } = require('../compat/validate-pin');
 
 const QUARANTINE_DIR_NAME = '_dsh-stale-kernel-quarantine';
 
@@ -70,10 +74,10 @@ function moveFile(from, to) {
  * @param {string} opts.appDir dsh-desktop 根（含 scripts/compat/kernel-pin.json
  *   与 vendor/dsh-kernel/）。
  * @param {(msg: string) => void} [opts.log]
- * @returns {{changed: boolean, pruned: string[], quarantinedTo: string|null, note?: string}}
+ * @returns {{changed: boolean, pruned: string[], rescued: string[], quarantinedTo: string|null, note?: string}}
  */
 function healVendorStaleKernels({ appDir, log = () => {} } = {}) {
-  const result = { changed: false, pruned: [], quarantinedTo: null };
+  const result = { changed: false, pruned: [], rescued: [], quarantinedTo: null };
   if (!appDir) { result.note = 'no-appDir'; return result; }
 
   let pin;
@@ -97,6 +101,28 @@ function healVendorStaleKernels({ appDir, log = () => {} } = {}) {
     return result; // 交给 compat-pin 的「离线内核目录缺失」暴露真问题
   }
 
+  // 旧版自愈曾把版本线独立的收编族当陈旧件隔离、下一轮整目录清掉。先于任何
+  // reset/清理把隔离区里的收编族救回 vendor（幂等；vendor 已有同件则跳过）。
+  const qdirPre = path.join(path.dirname(vendorDir), QUARANTINE_DIR_NAME);
+  try {
+    if (fs.existsSync(qdirPre)) {
+      for (const f of fs.readdirSync(qdirPre)) {
+        if (!f.endsWith('.tgz') || !isRehomedTarball(f)) continue;
+        const to = path.join(vendorDir, f);
+        if (fs.existsSync(to)) continue;
+        const mv = moveFile(path.join(qdirPre, f), to);
+        if (mv.ok) result.rescued.push(f);
+        else log('vendor-kernel 自愈: 收编族救回失败（留在隔离区）: ' + f + ' — ' + mv.err);
+      }
+      if (result.rescued.length > 0) {
+        result.changed = true;
+        log('vendor-kernel 自愈: 从隔离区救回 ' + result.rescued.length + ' 个收编族 tarball（旧版自愈误隔离）到 ' + vendorDir);
+      }
+    }
+  } catch (err) {
+    log('vendor-kernel 自愈: 隔离区扫描失败（本轮跳过救回）: ' + String((err && err.message) || err));
+  }
+
   let entries;
   try { entries = fs.readdirSync(vendorDir); }
   catch (err) { result.note = 'readdir-failed: ' + String((err && err.message) || err); return result; }
@@ -104,7 +130,7 @@ function healVendorStaleKernels({ appDir, log = () => {} } = {}) {
   if (tarballs.length === 0) { result.note = 'no-tarballs'; return result; }
 
   const matching = tarballs.filter((f) => f.includes(want));
-  const stale = tarballs.filter((f) => !f.includes(want));
+  const stale = tarballs.filter((f) => !f.includes(want) && !isRehomedTarball(f));
 
   if (stale.length === 0) {
     // 完全干净——顺手把上轮可能残留的隔离目录清掉（幂等）。
@@ -134,7 +160,7 @@ function healVendorStaleKernels({ appDir, log = () => {} } = {}) {
     else log('vendor-kernel 自愈: 单文件移动失败（继续处理其他）: ' + f + ' — ' + mv.err);
   }
 
-  result.changed = result.pruned.length > 0;
+  result.changed = result.pruned.length > 0 || result.rescued.length > 0;
   result.quarantinedTo = result.changed ? qdir : null;
   if (result.changed) {
     log('vendor-kernel 自愈完成: 移出 ' + result.pruned.length + ' 个非 pin(' + want + ') 内核 tarball 到 ' + qdir
