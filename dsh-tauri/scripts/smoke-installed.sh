@@ -36,6 +36,11 @@ listening_pids() { netstat -ano 2>/dev/null | grep -i LISTENING | awk '{print $N
 echo "[smoke] 布局组装: $SMOKE"
 rm -rf "$SMOKE"; mkdir -p "$SMOKE/resources" "$SMOKE/home" "$SMOKE/ud"
 cp -f "$EXE" "$SMOKE/"
+# gnu 工具链的 exe 动态导入 WebView2Loader.dll（安装布局中由安装器旁路在 exe
+# 同目录，见 installer.nsi 的 File /oname=WebView2Loader.dll；msvc 静态链接无
+# 此依赖）。只复制 exe 会让冒烟壳启动即死——且 MSYS 报错会把缺失文件名误报成
+# 一个无关的 api-ms-* 系统 DLL，排查时先查这里。
+cp -f "$TARGET_DIR"/*.dll "$SMOKE/" 2>/dev/null || true
 for pair in "package-payload/dsh-desktop:dsh-desktop" "sidecar:sidecar" "ui:ui"; do
   src="${pair%%:*}"; dst="${pair##*:}"
   robocopy "$REPO_ROOT/dsh-tauri/$src" "$SMOKE/resources/$dst" //MIR //R:1 //W:1 > /dev/null
