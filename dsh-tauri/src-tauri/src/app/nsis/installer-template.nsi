@@ -3,6 +3,10 @@
 ; --------------------------------------------------------------------------
 ; 基线：tauri-apps/tauri @ tauri-cli-v2.11.4
 ;   crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi
+; 2026-10-05 同步 tauri-cli 2.12.1：其 utils.nsh 的 CheckIfAppIsRunning 改用
+;   RestartManager API——模板必须 !include "Win\RestartManager.nsh" 且调用点传
+;   全路径 "$INSTDIR\${MAINBINARYNAME}.exe"（RmRegisterResources 只认全路径），
+;   否则 makensis 直接报 macro named "RestartManager_StartSession" not found。
 ; （@tauri-apps/cli 2.11.4 即 release-keys.md 的 npx 构建链所用版本；
 ;  升级 CLI 时必须同步重新 vendor 本文件，diff 只允许出现在标注 DSH 的段落）
 ;
@@ -42,6 +46,7 @@ ManifestDPIAwareness PerMonitorV2
 !include "FileAssociation.nsh"
 !include "Win\COM.nsh"
 !include "Win\Propkey.nsh"
+!include "Win\RestartManager.nsh"
 !include "StrFunc.nsh"
 ${StrCase}
 ${StrLoc}
@@ -657,7 +662,7 @@ Section Install
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; DSH：清理本安装树残留的内核 node 子进程（webServer/agent）并等句柄释放。
   ; CheckIfAppIsRunning 只识别主程序——node.exe 加载着 node_modules 下的原生 DLL
@@ -830,7 +835,7 @@ Section Uninstall
     !insertmacro NSIS_HOOK_PREUNINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Delete the app directory and its content from disk
   ; Copy main executable
