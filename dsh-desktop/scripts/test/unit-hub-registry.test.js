@@ -33,7 +33,7 @@ const {
   syncHotplugPackPointer,
   syncHubRecognition,
 } = require('../lib/hub-registry');
-const { COMPANION_PLUGINS, companionDirName } = require('../lib/companion-plugins');
+const { COMPANION_PLUGINS, companionDirName, RETIRED_COMPANION_DIRS } = require('../lib/companion-plugins');
 const { syncCompanionFiles } = require('../lib/companion-profile');
 
 // ---------------------------------------------------------------------------
@@ -513,11 +513,20 @@ test('收口：真实 assets/plugins 全部配套件元数据校验通过（防�
   const out = validateCompanionMetadata({ assetsRoot, plugins: COMPANION_PLUGINS, log: () => {} });
   assert.strictEqual(out.checked, COMPANION_PLUGINS.length);
   assert.deepStrictEqual(out.bad, [], '元数据漂移：' + JSON.stringify(out.bad, null, 2));
-  // 清单 ↔ assets 目录一一对应（多目录/漏登记都算漂移）
-  const listed = new Set(COMPANION_PLUGINS.map(companionDirName));
   const onDisk = new Set(fs.readdirSync(assetsRoot).filter((n) => {
     try { return fs.statSync(path.join(assetsRoot, n)).isDirectory(); } catch { return false; }
   }));
-  for (const dir of onDisk) assert.ok(listed.has(dir), 'assets/plugins/' + dir + ' 不在 COMPANION_PLUGINS 清单（会被过期清理误删或漏同步）');
+  // 清单 ↔ assets 目录一一对应（多目录/漏登记都算漂移）。RETIRED_COMPANION_DIRS
+  // 是唯一豁免面：退役伴随件的源目录按用户要求保留（源级用例仍读），但绝不进清单。
+  const listed = new Set(COMPANION_PLUGINS.map(companionDirName));
+  const retired = new Set(RETIRED_COMPANION_DIRS);
+  for (const dir of retired) {
+    assert.ok(!listed.has(dir), '退役目录不得同时出现在清单里: ' + dir);
+    assert.ok(onDisk.has(dir), '退役目录的源应保留（要真退役就删源，不要只摘清单）: ' + dir);
+  }
+  for (const dir of onDisk) {
+    if (retired.has(dir)) continue;
+    assert.ok(listed.has(dir), 'assets/plugins/' + dir + ' 不在 COMPANION_PLUGINS 清单（会被过期清理误删或漏同步）');
+  }
   for (const dir of listed) assert.ok(onDisk.has(dir), '清单声明的目录缺失: ' + dir);
 });

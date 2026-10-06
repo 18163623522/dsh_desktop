@@ -14,6 +14,14 @@
 //   shipsNodeModules  源目录的 node_modules 是 git 跟踪的正件依赖树，随同步分发；
 //                     缺省 false：源里的 node_modules 视为本机安装残留，绝不同步
 //                     （dev 树上一次 pnpm install 就能产出 1.3 万文件的残留树）。
+//
+// v1.0.0 纯净线：这份清单**不再随安装包分发**（`dsh-desktop/assets/plugins` 被
+// stage-payload.sh 与 tauri-release.yml 的 staging 显式剔出 payload），但清单本身
+// 必须保持完整、不得清空 —— 交付包里没有源目录时，boot 的 sync 步正是按这份
+// 名单把「历史上装过的配套件」计入 missingNames，进而撤回它们的 cordis.patch 条目
+// 与 bundle 注册。清空名单等于放弃撤回：老用户升级后 profile 里会留着指向缺失
+// 目录的注册行，装配失败表现为 "entries did not activate"，而一次致命启动会把
+// profile 的补丁层整体改名抹掉。要恢复随包分发，改的是 staging 排除面，不是这里。
 // ---------------------------------------------------------------------------
 
 const COMPANION_PLUGINS = [
@@ -42,7 +50,19 @@ const COMPANION_PLUGINS = [
   { id: 'dsh-vision', name: '@dsh-external/dsh-vision' },
   { id: 'side-session', name: '@dsh-external/dsh-side-session' },
   { id: 'compaction-acp', name: 'billion-context-dsh', shipsNodeModules: true },
-  { id: 'plugin-manager', name: '@deepseek-ai/dsh-plugin-manager' },
+  // v1.0.0 退役 `plugin-manager`（源目录 assets/plugins/dsh-plugin-manager 保留，
+  // 其健康卡用例 rv9 仍读源）：该伴随件的包名与官方内核包 @deepseek-ai/dsh-plugin-manager
+  // **同名**，而它的 host 半边是 Electron 时代的空壳（插件管理曾由壳主进程经 preload 桥
+  // window.dshDesktop.pluginManager 提供，Tauri 线没有这座桥）。镜像进
+  // profiles/web/node_modules 后按 Node 解析顺序它会遮蔽安装锚点里的官方包 →
+  // 官方 pluginManager 服务不再挂载 → 内核插件页判「本部署没有可管理的 profile」。
+  // 存量遮蔽由 companion-profile 的过期配套清理回收（见 KNOWN_COMPANION_DIR_NAMES）。
+  // 要复活：包名与 loader id 都得换 —— id 'plugin-manager' 同样撞
+  // dsh-base/cordis.patch.yml 的官方行 id，补丁层「按 id 整行替换」会劫持官方那一行。
+  // 补丁层不做手术：本机实测 profiles/web 的 cordis.yml / cordis.patch.yml 及其
+  // .bak-* 备份都没有 plugin-manager 行，遮蔽纯由目录造成。若哪天遇到历史机器上
+  // 残留 `- id: plugin-manager … disabled: true`，它会连带禁用官方实现，届时按
+  // 「行内必须含 disabled: true」窄判据回收（宽判据会误删官方的 config 覆盖行）。
   // 知识图谱记忆（adoresever/graph-memory，MIT）：跨会话图记忆 + PageRank /
   // 社区检测 + 向量去重；作者为 DSH 提供原生适配器（graph-memory/dsh 入口），
   // 内置后随壳分发，dsh-hub 中枢页直接显示装配状态与图谱统计。
@@ -144,4 +164,12 @@ function companionDirName(p) {
   return slash >= 0 ? p.name.slice(slash + 1) : p.name;
 }
 
-module.exports = { COMPANION_PLUGINS, companionDirName };
+// 已退役、但**源目录仍保留**在 assets/plugins 下的伴随件目录名（源级用例如 rv9
+// 健康卡仍读它们，纯净线也不随包分发）。退役即「从 COMPANION_PLUGINS 摘出 + 进这份
+// 名单」，两个动作一起做完：companion-profile 的过期配套清理据此回收历史上镜像进
+// profiles/<name>/node_modules 的副本，清单↔源目录的收口断言据此豁免。
+// 目前唯一条目 dsh-plugin-manager 的退役原因见 COMPANION_PLUGINS 内注释（包名撞
+// 官方内核包，镜像副本会遮蔽官方 pluginManager 服务）。
+const RETIRED_COMPANION_DIRS = ['dsh-plugin-manager'];
+
+module.exports = { COMPANION_PLUGINS, companionDirName, RETIRED_COMPANION_DIRS };

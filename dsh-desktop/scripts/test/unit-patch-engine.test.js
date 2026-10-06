@@ -399,9 +399,9 @@ test('companion-plugins: 既有前缀顺序与 workspace-anchor 位置唯一（�
       'conversation-tweaks',
       'quest-ui', 'dsh-super-injector', 'prompt-custom', 'workspace-anchor',
       'wsl-settings', 'dsh-vision', 'side-session', 'compaction-acp',
-      'plugin-manager', 'graph-memory',
+      'graph-memory', 'community-market',
     ],
-    '既有前缀顺序不得漂移（新增/改名须同步更新本测试；dsh-navbar 已随内核换代退役、graph-memory 内置后随壳分发）'
+    '既有前缀顺序不得漂移（新增/改名须同步更新本测试；dsh-navbar 已随内核换代退役、graph-memory 内置后随壳分发；plugin-manager 于 v1.0.0 退役——包名与官方内核包同名会遮蔽 profiles/web 里的官方 pluginManager）'
   );
   assert.strictEqual(ids.indexOf('workspace-anchor'), 11, 'workspace-anchor 应固定在 prompt-custom 之后');
   assert.strictEqual(ids.filter((id) => id === 'workspace-anchor').length, 1, 'workspace-anchor 不得重复');

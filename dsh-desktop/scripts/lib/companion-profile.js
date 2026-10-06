@@ -11,7 +11,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { COMPANION_PLUGINS, companionDirName } = require('./companion-plugins');
+const { COMPANION_PLUGINS, companionDirName, RETIRED_COMPANION_DIRS } = require('./companion-plugins');
 const { dropBlocksByIds } = require('../../profile-patch-heal');
 const { writeFileAtomic } = require('./patch-io');
 const { bundlePatchRel, verifyBundleDir } = require('../../profile-bundle-heal');
@@ -80,6 +80,13 @@ const KNOWN_COMPANION_DIR_NAMES = new Set([
   'dsh-terminal',
   'dsh-prompt',
   'dsh-third-party-thinking',
+  // v1.0.0 退役的插件管理伴随件（RETIRED_COMPANION_DIRS）必须进这份白名单而
+  // 不只是从清单里删掉：它的包名与官方内核包 @deepseek-ai/dsh-plugin-manager 同名，
+  // 历史同步已把它镜像进 profiles/web/node_modules，而 profile 根比安装锚点更近
+  // → 官方包被遮蔽，pluginManager 服务消失，内核插件页判「本部署没有可管理的
+  // profile」。清理仍受三重判定保护（白名单 + private + 描述含 "DSH Desktop"），
+  // 用户自装的同名官方包（非 private）不会被误删。
+  ...RETIRED_COMPANION_DIRS,
 ]);
 
 /**
