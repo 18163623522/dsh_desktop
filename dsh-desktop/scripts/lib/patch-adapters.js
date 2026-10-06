@@ -6,11 +6,14 @@
 // 所有运行时补丁的「变换」纯函数都从这里取用：
 //   - runtime-patches.js 的 9 个 transform 原样 re-export（变换实现仍留在该
 //     模块，锚点常量/注入代码字节级不变）；
-//   - 原 main.js 内联的 6 个 transform（image-send / vision-key /
-//     profile-patch-guard / settings-section-guard / workspace-search-rail /
-//     plugin-inventory-tab-merge）在此声明化，字节级输出与旧实现一致；
-//   - profile-bundle-guard 的两个 transform（app-boot / profile-boot）委托
-//     profile-bundle-heal.js 的唯一实现；
+//   - 原 main.js 内联的 transform 在此声明化（image-send / profile-patch-guard /
+//     plugin-inventory-tab-merge / profile patch-layer guard 等；vision-key /
+//     vision-toggle / workspace-search-rail / settings-section-guard 等锚点已随
+//     换代消失者，要么在函数上方写明休眠理由留在休眠名单里，要么直接删除，
+//     见 unit-patch-deps-coverage.test.js G 的可达性判据）；
+//   - profile-bundle-guard-appboot 与 profile-patch-layer-guard 两个 transform
+//     委托 profile-bundle-heal.js 的唯一实现（rc.2 起 profile-boot 半边装配面消失，
+//     原 profile-bundle-guard-profileboot 由 readProfilePatches 层的补丁层防护取代）；
 //   - 包级补丁（web-search / menu-viewport / session-manage /
 //     open-project-dir / workspace-pin / session-persistence）以「node_modules
 //     根应用器」形态收口，patch-runner 直接调用，不复制其锚点逻辑。
@@ -69,10 +72,9 @@ const {
 
 const {
   PROFILE_BUNDLE_GUARD_MARKER,
-  PROFILE_BOOT_GUARD_MARKER,
+  APP_BOOT_PATCH_LAYER_GUARD_MARKER,
   applyAppBootBundleGuard,
-  applyProfileBootHealGuard,
-  applyProfileBootBundleGuard,
+  applyAppBootPatchLayerGuard,
 } = require('../../profile-bundle-heal');
 
 // 包级补丁（node_modules 根应用器，唯一实现；签名 (nmRoot, log) => number）。
@@ -99,16 +101,16 @@ const { patchPiAiReasoningDefaults } = require('../patch-pi-ai-reasoning-default
 // 模糊信号：超窗或供应商网关拒绝/故障两成因并列提示，避免「400 status code
 // (no body)」死谜语，也不再误报成超限误导用户）。
 const { patchPiAiOverflowMessage } = require('../patch-pi-ai-overflow-message');
-// 设置写入韧性（PR5：v0.5.2「添加供应商没反应/灰」两层根治——孤儿锁自愈 +
-// 设置页命名空间自愈 + settings-conflict 静默重试）。
-const {
-  patchAtomicWriteOrphanLock,
-  patchSettingsModelsResilience,
-} = require('./patch-settings-write-resilience');
-// 模型设置页逐模型「支持图片输入」勾选（v0.6.1 之后：某些多模态模型被当文本模型
-// 拒收图片——手声明路由不写 input 时 pi-ai 恒回落 ["text"]，门槛与图片投影双双
-// 按文本处理）。同靶 dsh-client-ui-settings-models/lib/client.js 的另一区段。
-const { patchModelImageInput } = require('./patch-model-image-input');
+// 设置写入韧性（PR5：v0.5.2「添加供应商没反应/灰」两层根治——设置页命名空间自愈 +
+// settings-conflict 静默重试）。
+// 0.2.0-rc.2：孤儿锁自愈那半边已退役（上游 withFileLock 原生 takeOverExitedLock，
+// 见 patch-registry 退役说明），其 root 应用器接线随之摘除；
+// patchAtomicWriteOrphanLock / transformOrphanLock 保留在
+// patch-settings-write-resilience.js 内休眠，别在版本回退时误恢复。
+const { patchSettingsModelsResilience } = require('./patch-settings-write-resilience');
+// 0.2.0-rc.2：model-image-input 已退役（上游原生 inputModalities 控件 + adopt
+// 白名单 + 门槛语义三处前提全部失效），root 应用器接线摘除；
+// patch-model-image-input.js 保留休眠（参照 token-meter-clamp 先例）。
 // 插件 client bundle 到达瞬态失败重试（E2/问题A：bundle script ... failed to
 // load 单次 404/换内核即永久失败——浏览器半边 script 重试 + serveBundle 读盘
 // 瞬态码短重试）。
@@ -129,25 +131,49 @@ const { patchEmptyToolName } = require('./empty-tool-name-patch');
 // 文本模型自动识图补丁（原 main.js applyImageSendFix 内联 transform）。
 // ---------------------------------------------------------------------------
 const IMAGE_SEND_MARKER = 'DSH Desktop: reuse the dsh-vision VLM config';
-const IMAGE_SEND_HELPER_ANCHOR = 'function routeServed(ctx, provider) {';
+// 0.2.0-rc.2 重锚：helper 注入点从 routeServed 换成 resolvePromptFileReceipts
+// （rc.2 删掉了 routeServed，改用 modelAvailable / 内联 listProviders）。
+// resolvePromptFileReceipts 在两代内核里都是模块作用域、逐字唯一命中，
+// 函数声明提升让 helper 在更早的调用点也可用。
+const IMAGE_SEND_HELPER_ANCHOR = 'function resolvePromptFileReceipts(content, stagedFile) {';
 const IMAGE_SEND_HELPER = `
 /** DSH Desktop: reuse the dsh-vision VLM config to describe images as text so text-only models can "see" them. */
 async function describeImagesWithVision(ctx, content) {
 	const settings = ctx.get("settings");
 	let vision = null;
+	// 是否见过 dsh-vision 这一设置命名空间（区分「没装识图插件」与「装了但没配」）。
+	let visionEntrySeen = false;
 	if (settings !== void 0 && typeof settings.get === "function") {
 		// dsh-desktop fix: read the resolved HOST-side value (settings.get), not the
 		// redacted wire snapshot. redactSecrets strips role('secret') fields, so
 		// describe({redactSecrets:true}) drops apiKey and every keyed VLM endpoint
 		// answers 401 — image sends failed for configured users.
 		const resolved = settings.get("dsh-vision");
-		if (resolved !== void 0 && typeof resolved === "object") vision = resolved;
+		if (resolved !== void 0 && typeof resolved === "object") {
+			vision = resolved;
+			visionEntrySeen = true;
+		}
 	}
 	if (vision === null && settings !== void 0 && typeof settings.describe === "function") {
-		try {
-			const descriptor = settings.describe({ redactSecrets: true }).find((candidate) => String(candidate.ns) === "dsh-vision");
-			if (descriptor !== void 0 && descriptor.value !== void 0 && typeof descriptor.value === "object") vision = descriptor.value;
-		} catch {}
+		// 0.2.0-rc.2 起 SettingsForms 不再有 get()：host 侧 describe()（不传
+		// options）返回未脱敏的实时 value，正是上面那条修复要的形状；先按未脱敏
+		// 读，抛错再退回脱敏形态（旧内核的 describe 可能要求 options）。
+		for (const options of [void 0, { redactSecrets: true }]) {
+			try {
+				const descriptor = settings.describe(options).find((candidate) => String(candidate.ns) === "dsh-vision");
+				if (descriptor === void 0) continue;
+				visionEntrySeen = true;
+				if (descriptor.value !== void 0 && typeof descriptor.value === "object") vision = descriptor.value;
+				break;
+			} catch {}
+		}
+	}
+	// dsh-vision 根本没装（纯净版客户端的常态）：与用户主动关闭同路处理，回落
+	// 上游 MODEL_DOES_NOT_SUPPORT_IMAGES，而不是指向一个不存在的设置页。
+	if (vision === null && visionEntrySeen === false) {
+		const notInstalled = new Error("dsh-vision entry is not installed");
+		notInstalled.dshVisionDisabled = true;
+		throw notInstalled;
 	}
 	// DSH Desktop: dsh-vision master switch (enabled) — off means the user turned
 	// the whole capability off in 设置 → 识图插件：skip conversion and flag the
@@ -416,69 +442,27 @@ function transformProfileBundleAppBoot(src, file) {
   return { status: 'changed', src: out.src };
 }
 
-// rc.8 起 dsh 主包的两个 profile-boot-*.js 中可能有一个是纯 re-export 存根
-// （如 `import { o as runProfile } from "./profile-boot-DG5t9aNs.js"; export { runProfile };`），
-// 真实装配面在另一个 bundle 里（由它自身的注入覆盖）。存根没有可守护的代码，
-// 不算版本漂移，按已处理跳过，避免每次启动误报失配。
-const PROFILE_BOOT_STUB_RE = /^import\s*\{[^}]+\}\s*from\s*"\.\/profile-boot-[A-Za-z0-9_-]+\.js";\s*export\s*\{[^}]+\};?\s*$/;
-
-function transformProfileBundleProfileBoot(src, file) {
-  let current = src;
-  // rc.8 纯 re-export 存根：无 heal/bundle 装配面，无需补丁（幂等静默）。
-  if (PROFILE_BOOT_STUB_RE.test(current.trim())) return { status: 'already' };
-  let changed = false;
-  // heal 调用防护（独立幂等标记）：入口 bundle 无 heal 调用时静默。
-  const heal = applyProfileBootHealGuard(current);
-  if (heal.changed) { current = heal.src; changed = true; }
-  const bundle = applyProfileBootBundleGuard(current);
-  if (bundle.changed) { current = bundle.src; changed = true; }
-  if (changed) return { status: 'changed', src: current };
-  if (!current.includes(PROFILE_BOOT_GUARD_MARKER)) {
-    return { status: 'anchor-missing', detail: file + ' 锚点未匹配（dsh 版本可能已变化），跳过' };
+// ---------------------------------------------------------------------------
+// 用户补丁层自愈（0.2.0-rc.2 起收口到 dsh-app-boot 的 readProfilePatches）。
+// ---------------------------------------------------------------------------
+function transformProfilePatchLayerGuard(src, file) {
+  const out = applyAppBootPatchLayerGuard(src);
+  if (!out.changed) {
+    if (!src.includes(APP_BOOT_PATCH_LAYER_GUARD_MARKER)) {
+      return { status: 'anchor-missing', detail: file + ' 锚点未匹配（dsh 版本可能已变化），跳过' };
+    }
+    return { status: 'already' }; // 已注入（幂等，静默）
   }
-  return { status: 'already' }; // 已注入（幂等，静默）
+  return { status: 'changed', src: out.src };
 }
 
 // ---------------------------------------------------------------------------
-// dsh-settings 注册防护（原 applySettingsSectionGuard 内联 transform）。
+// 【已退役】dsh-settings 注册防护：0.2.0-rc.2 起 SettingsForms 不再有消费侧
+// register/installSection 调用点（this.register 全树 0 命中），设置行改由
+// configEditor.configuration() 派生，describe() 的抛错已被上游 invalidate()
+// 的 try/catch + logger.error 收口，legacy settings.yaml 逐 section try/catch。
+// 防护失去插入点，故连 transform 一起删除。
 // ---------------------------------------------------------------------------
-const SETTINGS_SECTION_MARKER = 'dsh-desktop guard: an invalid stored section must not brick';
-// 0.1.2-alpha.2：消费侧胶水函数（sctx.settings.register）重构为 provider 类方法
-// installSection（pristine dsh-settings/lib/index.js 实证），register 调用点改为
-// this.register、缩进不变（2-tab）。守卫语义零变化：register 抛错（存储 section
-// 损坏 resolve 失败）不再击穿消费方 fiber，回落 composition 配置，命名空间本次
-// boot 不可用。logger 接收方同步改 this.ctx.logger（alpha.2 同类内既有用法，
-// 如 "keeping last good" 分支）。
-const SETTINGS_SECTION_ANCHOR = '\t\tconst scope = this.register(ns, schema, {';
-const SETTINGS_SECTION_GUARDED =
-  '\t\tlet scope;\n' +
-  '\t\ttry {\n' +
-  '\t\t\tscope = this.register(ns, schema, {\n' +
-  '\t\t\t\tbase: entry,\n' +
-  '\t\t\t\t...hooks.validate === void 0 ? {} : { validate: hooks.validate }\n' +
-  '\t\t\t});\n' +
-  '\t\t} catch (error) {\n' +
-  '\t\t\t// dsh-desktop guard: an invalid stored section must not brick the consumer\n' +
-  '\t\t\t// fiber (fail-loud boot). Fall back to the composition config; the\n' +
-  '\t\t\t// namespace simply stays unavailable until the stored section is fixed.\n' +
-  '\t\t\tthis.ctx.logger.warn("settings: registration for \\"%s\\" failed; falling back to the composition config this boot", ns);\n' +
-  '\t\t\tthis.ctx.logger.warn(error);\n' +
-  '\t\t\ttry {\n' +
-  '\t\t\t\thooks.setSource(() => entry);\n' +
-  '\t\t\t\thooks.onChange();\n' +
-  '\t\t\t} catch {}\n' +
-  '\t\t\treturn;\n' +
-  '\t\t}\n' +
-  '\t\thooks.setSource(() => scope.get());';
-const SETTINGS_SECTION_FROM = '\t\tconst scope = this.register(ns, schema, {\n\t\t\tbase: entry,\n\t\t\t...hooks.validate === void 0 ? {} : { validate: hooks.validate }\n\t\t});\n\t\thooks.setSource(() => scope.get());';
-
-function transformSettingsSectionGuard(src, file) {
-  if (src.includes(SETTINGS_SECTION_MARKER)) return { status: 'already' }; // 已应用（幂等，静默）
-  if (!src.includes(SETTINGS_SECTION_ANCHOR)) {
-    return { status: 'anchor-missing', detail: file + ' 锚点未匹配（dsh 版本可能已变化），跳过' };
-  }
-  return { status: 'changed', src: src.replace(SETTINGS_SECTION_FROM, SETTINGS_SECTION_GUARDED) };
-}
 
 // ---------------------------------------------------------------------------
 // 【休眠·已被上游取代】dsh-client-ui-workspace 搜索栏修复（原 applyWorkspaceSearchRailFix）。
@@ -665,69 +649,106 @@ function transformTerminalInterruptEscalation(src, file) {
 // roster 只有 standard/code/minimal/cordis，resolve() 查无此 id 即抛
 // UnknownPresetError，resume 硬失败且无任何回落——会话永久变砖（第二轮白屏）。
 //
-// 修法：resolve() 的「查无此 id」分支改为 warn 降级回落（minimal-win→语义
-// 最近的 minimal；其余未知 id→保底 standard；回落目标必须真实存在于 roster），
-// 回落时 console.warn 中文日志（原 id / 回落目标 / 原因 / 原错误 message，保留
-// 原错误对象信息便于诊断）。roster 全空或回落目标也缺失时维持原样抛错（此时
-// 无可回落，硬抛是对的）。只动「Unknown」：PresetMountError（组合文件损坏 =
-// 部署真坏了）不经本补丁、保持硬抛。
+// 修法：「查无此 id」分支改为 warn 降级回落（minimal-win→语义最近的 minimal；
+// 其余未知 id→保底 standard；回落目标必须真实存在于 roster），回落时 console.warn
+// 中文日志（原 id / 回落目标 / 原因）。roster 全空或回落目标也缺失时维持原样抛错
+//（此时无可回落，硬抛是对的）。只动 not-found：broken 预设（组合文件损坏 = 部署
+// 真坏了）的 agent-preset/invalid 与 resolve 返回的 broken 字段不经本补丁、保持响亮。
 // 目标双文件：lib/index.js（运行时经 exports "." 实际加载的唯一入口）与同源
 // 的 lib/invariant.js（无人加载，一并覆盖防未来消费方；两文件锚点文本一致）。
 // 上游修复意向：上游在 resolve()/resume 链内置同款回落后，本补丁经 already /
 // anchor-missing 自然退役（参照 vision-key-fix 休眠先例）。
+//
+// rc.2 重锚（2026-10-05）：预设 roster 包 dsh-agent-presets 已拆成
+// dsh-agent-preset（声明）+ dsh-agent-preset-registry（注册表，UnknownPresetError
+// 时代的 resolve 硬抛点在那里）。resolve()（只读身份）与 retain()（mount 的引用
+// 计数路径，包在 while(true) CAS 循环内）两处都抛 not-found，故两处都回落——
+// 各 return this.resolve/retain(fallbackId) 递归一次即命中存在项终止。旧的
+// completions 形态锚（presets.find + return found）随包名一起移除。
 // ---------------------------------------------------------------------------
 const AGENT_PRESET_FALLBACK_MARKER = 'dsh-desktop fix: agent-preset-fallback';
-// 0.1.2-alpha.1：resolve() 内层缩进从 2-tab 变为 3-tab（async resolve 内的 list 前
-// 置声明层），锚点与注入体同步改用 3-tab 缩进。
-// 0.1.2-alpha.2：UnknownPresetError 消失，查无此 id 改抛多行
-// `new RemoteError("agent-preset/not-found", …, { agentPreset, available })`
-// （pristine dsh-agent-presets/lib/index.js + 同源 invariant.js 实证，双文件锚点
-// 文本一致）。锚点同步改用新形态；回落语义零变化——未知 id 先 warn 回落
-// （minimal-win→minimal、其余未知 id→standard），无可回落目标时原样抛上游
-// RemoteError（与旧补丁「保持原样抛错」等价），resolveMountable 的 broken 硬抛
-// 不经本补丁。
-const AGENT_PRESET_FALLBACK_ANCHOR = [
-  '\t\t\tconst found = presets.find((preset) => preset.id === wanted);',
-  '\t\t\tif (found === void 0) {',
-  '\t\t\t\tconst available = presets.map((preset) => preset.id);',
-  '\t\t\t\tthrow new RemoteError("agent-preset/not-found", `agent-presets: preset "${wanted}" not found (available: ${available.join(", ") || "none"})`, {',
-  '\t\t\t\t\tagentPreset: wanted,',
-  '\t\t\t\t\tavailable',
-  '\t\t\t\t});',
-  '\t\t\t}',
-  '\t\t\treturn found;',
+// 注入位：注册表类的闭包头（helper 与 resolve/retain 同作用域，两处运行时副本一致）。
+const AGENT_PRESET_FALLBACK_CLASS_ANCHOR = '\treturn class AgentPresetRegistry extends _classSuper {';
+const AGENT_PRESET_FALLBACK_HELPER = [
+  '// ' + AGENT_PRESET_FALLBACK_MARKER + ' — a session or profile may reference a preset',
+  '// id this deployment no longer ships (0.5.0 dropped the Electron-era "minimal-win").',
+  '// A hard not-found bricks resume forever, so fall back to the closest semantic preset',
+  '// and warn. Returns void 0 when there is nothing to fall back to, and the caller keeps',
+  '// the upstream not-found throw.',
+  'function __dshAgentPresetFallbackId(wanted, available) {',
+  '\tif (available.length === 0) return void 0;',
+  '\tif (wanted === "minimal-win" && available.includes("minimal")) return "minimal";',
+  '\treturn available.includes("standard") ? "standard" : void 0;',
+  '}',
+  '',
+  AGENT_PRESET_FALLBACK_CLASS_ANCHOR,
 ].join('\n');
-const AGENT_PRESET_FALLBACK_INJECTION = [
-  '\t\t\tconst found = presets.find((preset) => preset.id === wanted);',
-  '\t\t\tif (found === void 0) {',
-  '\t\t\t\tconst available = presets.map((preset) => preset.id);',
-  '\t\t\t\t// dsh-desktop fix: agent-preset-fallback — a session or profile may reference a',
-  '\t\t\t\t// preset id this deployment no longer ships (0.5.0 dropped the Electron-era',
-  '\t\t\t\t// "minimal-win"). A hard not-found error here bricks resume forever; fall',
-  '\t\t\t\t// back to the closest semantic preset and warn instead. Only "unknown id"',
-  '\t\t\t\t// degrades — a broken-preset refusal stays a loud failure (mount paths',
-  '\t\t\t\t// re-check the resolved preset after this resolve).',
-  '\t\t\t\tconst fallbackId = wanted === "minimal-win" && available.includes("minimal") ? "minimal" : available.includes("standard") ? "standard" : void 0;',
-  '\t\t\t\tconst fallback = fallbackId === void 0 ? void 0 : presets.find((preset) => preset.id === fallbackId);',
-  '\t\t\t\tif (fallback !== void 0) {',
-  '\t\t\t\t\tconsole.warn(`[dsh] agent-presets 预设回落：引用的预设 "${wanted}" 在当前安装中不存在（可用：${available.join(", ") || "无"}），已自动回落到语义最近的预设 "${fallback.id}"（原因：该预设随版本升级移除，回落规则 minimal-win→minimal、其余未知 id→standard）。会话将以回落预设继续恢复，建议在预设选择中重新挑选。原始错误：agent-presets: preset "${wanted}" not found`);',
-  '\t\t\t\t\treturn fallback;',
+// 回落告警（resolve/retain 共用措辞，mount 路径额外注明，便于日志里区分两条链路）。
+function agentPresetFallbackWarn(wanted, available, fallbackId, channel) {
+  return '\t\t\t\t\tconsole.warn(`[dsh] agent-preset 预设回落' + channel + '：引用的预设 "${wanted}" 在当前安装中不存在（可用：${available.join(", ") || "无"}），已自动回落到语义最近的预设 "${fallbackId}"（原因：该预设随版本升级移除，回落规则 minimal-win→minimal、其余未知 id→standard）。会话将以回落预设继续恢复，建议在预设选择中重新挑选。`);';
+}
+// 站点 ①：resolve()（3 tab 方法体）。
+const AGENT_PRESET_FALLBACK_RESOLVE_ANCHOR = [
+  '\t\t\tif (record === void 0) throw new RemoteError("agent-preset/not-found", `Unknown agent preset: ${wanted}`, {',
+  '\t\t\t\tagentPreset: wanted,',
+  '\t\t\t\tavailable: [...this.definitions.keys()]',
+  '\t\t\t});',
+].join('\n');
+const AGENT_PRESET_FALLBACK_RESOLVE_INJECTION = [
+  '\t\t\tif (record === void 0) {',
+  '\t\t\t\tconst available = [...this.definitions.keys()];',
+  '\t\t\t\tconst fallbackId = __dshAgentPresetFallbackId(wanted, available);',
+  '\t\t\t\tif (fallbackId !== void 0) {',
+  agentPresetFallbackWarn('wanted', 'available', 'fallbackId', ''),
+  '\t\t\t\t\treturn this.resolve(fallbackId);',
   '\t\t\t\t}',
-  '\t\t\t\tthrow new RemoteError("agent-preset/not-found", `agent-presets: preset "${wanted}" not found (available: ${available.join(", ") || "none"})`, {',
+  '\t\t\t\tthrow new RemoteError("agent-preset/not-found", `Unknown agent preset: ${wanted}`, {',
   '\t\t\t\t\tagentPreset: wanted,',
   '\t\t\t\t\tavailable',
   '\t\t\t\t});',
   '\t\t\t}',
-  '\t\t\treturn found;',
 ].join('\n');
+// 站点 ②：retain()（4 tab，while(true) CAS 循环内；mount 链路经此）。
+const AGENT_PRESET_FALLBACK_RETAIN_ANCHOR = [
+  '\t\t\t\tif (record === void 0) throw new RemoteError("agent-preset/not-found", `Unknown agent preset: ${wanted}`, {',
+  '\t\t\t\t\tagentPreset: wanted,',
+  '\t\t\t\t\tavailable: [...this.definitions.keys()]',
+  '\t\t\t\t});',
+].join('\n');
+const AGENT_PRESET_FALLBACK_RETAIN_INJECTION = [
+  '\t\t\t\tif (record === void 0) {',
+  '\t\t\t\t\tconst available = [...this.definitions.keys()];',
+  '\t\t\t\t\tconst fallbackId = __dshAgentPresetFallbackId(wanted, available);',
+  '\t\t\t\t\tif (fallbackId !== void 0) {',
+  agentPresetFallbackWarn('wanted', 'available', 'fallbackId', '（mount）'),
+  '\t\t\t\t\t\treturn this.retain(fallbackId);',
+  '\t\t\t\t\t}',
+  '\t\t\t\t\tthrow new RemoteError("agent-preset/not-found", `Unknown agent preset: ${wanted}`, {',
+  '\t\t\t\t\t\tagentPreset: wanted,',
+  '\t\t\t\t\t\tavailable',
+  '\t\t\t\t\t});',
+  '\t\t\t\t}',
+].join('\n');
+
+const AGENT_PRESET_FALLBACK_PAIRS = [
+  [AGENT_PRESET_FALLBACK_RESOLVE_ANCHOR, AGENT_PRESET_FALLBACK_RESOLVE_INJECTION],
+  [AGENT_PRESET_FALLBACK_RETAIN_ANCHOR, AGENT_PRESET_FALLBACK_RETAIN_INJECTION],
+];
 
 function transformAgentPresetFallback(src, file) {
   if (src.includes(AGENT_PRESET_FALLBACK_MARKER)) return { status: 'already' };
-  if (!src.includes(AGENT_PRESET_FALLBACK_ANCHOR)) {
-    return { status: 'anchor-missing', detail: '未找到 agent-presets resolve 抛错锚点（版本可能已变化），跳过 ' + file };
+  const missing = [];
+  if (src.split(AGENT_PRESET_FALLBACK_CLASS_ANCHOR).length - 1 !== 1) missing.push('AgentPresetRegistry 类头');
+  for (const [name, anchor] of [['resolve', AGENT_PRESET_FALLBACK_RESOLVE_ANCHOR], ['retain', AGENT_PRESET_FALLBACK_RETAIN_ANCHOR]]) {
+    if (src.split(anchor).length - 1 !== 1) missing.push(name + ' not-found 抛错点');
+  }
+  if (missing.length > 0) {
+    return { status: 'anchor-missing', detail: '未唯一命中 agent-preset 回落锚点（' + missing.join(' / ') + '，版本可能已变化），跳过 ' + file };
   }
   // 函数替换器：注入文本含 ${...} 模板字面量，规避 String.replace 对 $ 序列的替换语义。
-  return { status: 'changed', src: src.replace(AGENT_PRESET_FALLBACK_ANCHOR, () => AGENT_PRESET_FALLBACK_INJECTION) };
+  let out = src.replace(AGENT_PRESET_FALLBACK_CLASS_ANCHOR, () => AGENT_PRESET_FALLBACK_HELPER);
+  for (const [from, to] of AGENT_PRESET_FALLBACK_PAIRS) out = out.replace(from, () => to);
+  return { status: 'changed', src: out };
 }
 
 // ---------------------------------------------------------------------------
@@ -787,7 +808,7 @@ function transformPromptContextLiteral(src, file) {
 // ---------------------------------------------------------------------------
 // K1 根因修复（2026-08）：「credentials service is absent」偶发于桌面端。
 //
-// 根因链（字节级证据见 scripts/test/unit-fallback-heal-isolation.test.js）：
+// 根因链（历史现场；第 2 步的 heal 子系统已在 rc.2 被上游删除，见下方退役说明）：
 //   1. `$DSH_HOME/profiles/node_modules/@deepseek-ai/*` fallback junction 曾被
 //      指向一个后来被删除的安装（活体现场：全部指向已不存在的
 //      `%TEMP%\dsh-portable-sandbox\...`）；
@@ -801,67 +822,21 @@ function transformPromptContextLiteral(src, file) {
 //      API key 才看到 apiproxy 的「credentials service is absent」。
 // 网页端不共享 `%TEMP%`/双安装现场，故表现为「桌面端偶发」。
 //
-// 三层修复（均为幂等纯变换）：
-//   a. fallback-heal-isolation（dsh-app-boot）：单个坏名字就地重试后跳过并打
-//      `[fallback-heal] entry <name> failed: ...` 标记，其余名字照常 heal——
-//      半套树窗口从「整轮放弃」缩小到「恰好那一个坏名字」；
-//   b. credentials-initial-retry（dsh-credentials-local）：activate 首读的
+// 两层修复（均为幂等纯变换）：
+//   a. credentials-initial-retry（dsh-credentials-local）：activate 首读的
 //      stat/readFile 对 Windows 瞬时 EBUSY/EPERM/EACCES 重试 3 次（递增退避），
 //      「AV 锁瞬时报错 → 激活失败 → 静默缺席」的触发面收窄；
-//   c. credentials-absent-guidance（dsh-host-apiproxy）：报错文案追加修复指引，
+//   b. credentials-absent-guidance（dsh-host-apiproxy）：报错文案追加修复指引，
 //      即使降级态发生，用户看到的也是「重启一次自动修复」而不是死谜语。
+//
+// 【已退役】原 (a) fallback-heal-isolation：0.2.0-rc.2 删掉了整个 fallback
+// junction heal 子系统（healProfilesModuleFallback / ensureModuleProxy /
+// ensureSymlink / modulesDir 在 rc.2 全树 0 命中），改为 link projections
+// （removeLinkProjections + readProfileVersionExemptions + 兼容门禁），
+// 单点中断的写链接循环不复存在，故删除。
 // ---------------------------------------------------------------------------
 
-// a. fallback heal 单点容错。
-const FALLBACK_HEAL_ISOLATION_MARKER = 'dsh-desktop heal isolation: one stale fallback entry must not abort the whole heal';
-// 0.1.2-alpha.1：fallback heal 循环从「`for (const [packageName, target] of links)`
-// + 无条件 ensureSymlink」重构为「`for (const entry of entries)` + proxy/symlink
-// 分派（entry.kind === "proxy" 走 ensureModuleProxy，否则 ensureSymlink）」。
-const FALLBACK_HEAL_LOOP_OLD = [
-  '\tfor (const entry of entries) {',
-  '\t\tconst link = join(modulesDir, entry.packageName);',
-  '\t\tmkdirSync(dirname(link), { recursive: true });',
-  '\t\tif (entry.kind === "proxy") ensureModuleProxy(link, entry.packageName, entry.version, entry.targets);',
-  '\t\telse ensureSymlink(link, entry.packageDir);',
-  '\t}',
-].join('\n');
-const FALLBACK_HEAL_LOOP_NEW = [
-  '\tfor (const entry of entries) {',
-  '\t\tconst link = join(modulesDir, entry.packageName);',
-  '\t\tmkdirSync(dirname(link), { recursive: true });',
-  '\t\t// ' + FALLBACK_HEAL_ISOLATION_MARKER + ' (K1): a single bad entry must',
-  '\t\t// not abort the whole heal — a half-healed fallback tree leaves host-',
-  '\t\t// composition services (e.g. dsh-credentials-local) silently absent and',
-  '\t\t// the user only finds out when saving an API key. Retry the move in',
-  '\t\t// place (Windows AV/EPERM transients, concurrent-heal EEXIST races),',
-  '\t\t// then isolate the one name and keep healing the rest.',
-  '\t\ttry {',
-  '\t\t\tif (entry.kind === "proxy") ensureModuleProxy(link, entry.packageName, entry.version, entry.targets);',
-  '\t\t\telse ensureSymlink(link, entry.packageDir);',
-  '\t\t} catch (healError) {',
-  '\t\t\tlet healed = false;',
-  '\t\t\tfor (let healRetry = 0; healRetry < 3; healRetry += 1) {',
-  '\t\t\t\ttry {',
-  '\t\t\t\t\tif (entry.kind === "proxy") ensureModuleProxy(link, entry.packageName, entry.version, entry.targets);',
-  '\t\t\t\t\telse ensureSymlink(link, entry.packageDir);',
-  '\t\t\t\t\thealed = true;',
-  '\t\t\t\t\tbreak;',
-  '\t\t\t\t} catch {}',
-  '\t\t\t}',
-  '\t\t\tif (!healed) process.stderr.write(`[fallback-heal] entry ${entry.packageName} failed: ${healError instanceof Error ? healError.message : String(healError)}\\n`);',
-  '\t\t}',
-  '\t}',
-].join('\n');
-
-function transformFallbackHealIsolation(src, file) {
-  if (src.includes(FALLBACK_HEAL_ISOLATION_MARKER) && src.includes('[fallback-heal] entry ')) return { status: 'already' };
-  if (!src.includes(FALLBACK_HEAL_LOOP_OLD)) {
-    return { status: 'anchor-missing', detail: '未找到 fallback heal 写链接循环锚点（版本可能已变更），跳过 ' + file };
-  }
-  return { status: 'changed', src: src.replace(FALLBACK_HEAL_LOOP_OLD, FALLBACK_HEAL_LOOP_NEW) };
-}
-
-// b. credentials-local activate 首读的瞬时文件错误重试。
+// a. credentials-local activate 首读的瞬时文件错误重试。
 const CREDENTIALS_INITIAL_RETRY_MARKER = 'dsh-desktop compat: transient initial credentials read retries';
 const CREDENTIALS_LOAD_INITIAL_OLD = [
   '\t\tlet text;',
@@ -998,6 +973,25 @@ const DEVICE_AUTH_THROW_ANCHOR = [
   '\t\t\t\tif (providerError?.message) message = providerError.message;',
   '\t\t\t} catch {}',
 ].join('\n');
+// 0.2.0-rc.2 第三形态（V3，最优先）：非 2xx 分支改走 providerErrorDetail →
+// providerError → files.errorMessage(status, message, detail)，不再存在可变的
+// message 变量，前两代「往 message 追加一句」的锚点因此全部失配。这里吃
+// failure + throw 两行，把指引拼在最终抛出文案的尾部（errorMessage 的返回值就是
+// 用户看到的那句），命中条件与前两代逐字相同。
+const DEVICE_AUTH_THROW_ANCHOR_V3 = [
+  '\t\t\t\t\tconst failure = providerError(raw, response.status, response.headers);',
+  '\t\t\t\t\tthrow new LlmError(files.errorMessage(response.status, failure.message, detail), failure.code, {',
+].join('\n');
+const DEVICE_AUTH_THROW_REPLACEMENT_V3 = [
+  '\t\t\t\t\tconst failure = providerError(raw, response.status, response.headers);',
+  '\t\t\t\t\t// ' + DEVICE_AUTH_GUIDANCE_MARKER + ': a provider-side device/risk-control',
+  '\t\t\t\t\t// rejection (e.g. "This device is not authorized. Please contact the',
+  '\t\t\t\t\t// administrator or try again later.") is a credential problem the client',
+  '\t\t\t\t\t// cannot retry or reinstall its way out of — append the actionable remedy',
+  '\t\t\t\t\t// so the user is not left with an English riddle.',
+  '\t\t\t\t\tconst __dshDeviceAuthHint = (response.status === 401 || response.status === 403) && /not authorized|\\u8bbe\\u5907\\u672a\\u6388\\u6743|contact the administrator|device.{0,24}(unauthorized|not allowed)/i.test(`${failure.message ?? ""} ${detail ?? ""}`) ? " ——【凭据被 DeepSeek 服务端拒绝（令牌失效或账号设备风控）】请到 chat.deepseek.com 重新登录获取新令牌，在 设置 → 模型 页重新填入 API 密钥后重试；重装客户端或反复点「重试」无效。" : "";',
+  '\t\t\t\t\tthrow new LlmError(files.errorMessage(response.status, failure.message, detail) + __dshDeviceAuthHint, failure.code, {',
+].join('\n');
 /** 指引注入体（indent = 抛错块 if 体的缩进层级；注释/if/message 行随层）。 */
 function deviceAuthGuidanceBlock(indent) {
   const inner = indent + '\t';
@@ -1015,6 +1009,10 @@ function deviceAuthGuidanceBlock(indent) {
 
 function transformDeviceAuthGuidance(src, file) {
   if (src.includes(DEVICE_AUTH_GUIDANCE_MARKER)) return { status: 'already' };
+  // 0.2.0-rc.2 形态（failure + throw 两行，指引拼在抛出文案尾部）。
+  if (src.includes(DEVICE_AUTH_THROW_ANCHOR_V3)) {
+    return { status: 'changed', src: src.replace(DEVICE_AUTH_THROW_ANCHOR_V3, () => DEVICE_AUTH_THROW_REPLACEMENT_V3) };
+  }
   // rc.1/rc.2 形态（3-tab if 体 → 指引 4-tab 基准）。
   if (src.includes(DEVICE_AUTH_THROW_ANCHOR_V2)) {
     return { status: 'changed', src: src.replace(DEVICE_AUTH_THROW_ANCHOR_V2, () => DEVICE_AUTH_THROW_ANCHOR_V2 + '\n' + deviceAuthGuidanceBlock('\t\t\t\t')) };
@@ -1310,16 +1308,18 @@ function transformAdapterPrepareCallGuard(src, file) {
 // contentHasImage 非数组守卫（v0.6.0 用户反馈「本轮运行失败 Cannot read
 // properties of undefined (reading 'some')」）。dsh-llm 的 contentHasImage 是
 // 所有图片策略（capability gating / text-only serialization / compaction survey）
-// 共用的唯一递归图片遍历；它对 tool-result 递归调用 contentHasImage(block.content)，
-// 而某个 tool-result 块的 content 可能为非数组（undefined）——裸 content.some
-// 即抛 "Cannot read properties of undefined (reading 'some')"，经 adapterStream →
-// turn/end 冒泡成整轮失败。非数组内容天然不含图片，直接返回 false 即可。
-// 上游修复意向：上游给 contentHasImage 加 Array 守卫后，本补丁经 already /
-// anchor-missing 自然退役。
+// 共用的唯一递归图片遍历；调用方按 message.content / block.content 传入，任何
+// 一处缺字段即 undefined → 裸 content.some 抛 "Cannot read properties of
+// undefined (reading 'some')"，经 adapterStream → turn/end 冒泡成整轮失败。
+// 非数组内容天然不含图片，直接返回 false 即可。
+// 锚点只取「函数头 + return content.some(」这一段：0.2.0-rc.2 把 tool-result
+// 递归从函数体里删掉了（改为单层 image 判定），函数体锚点因此失配，而这段前缀
+// 在两代内核里都逐字唯一命中。上游给 contentHasImage 加 Array 守卫后，本补丁
+// 经 already / anchor-missing 自然退役。
 // ---------------------------------------------------------------------------
 const CONTENT_HAS_IMAGE_GUARD_MARKER = 'dsh-desktop fix: contentHasImage non-array guard';
-const CONTENT_HAS_IMAGE_OLD = '\treturn content.some((block) => block.type === "image" || block.type === "tool-result" && contentHasImage(block.content));';
-const CONTENT_HAS_IMAGE_NEW = '\tif (!Array.isArray(content)) return false; // ' + CONTENT_HAS_IMAGE_GUARD_MARKER + ' (a tool-result block may carry undefined content; non-array holds no image)\n' + CONTENT_HAS_IMAGE_OLD;
+const CONTENT_HAS_IMAGE_OLD = 'function contentHasImage(content) {\n\treturn content.some(';
+const CONTENT_HAS_IMAGE_NEW = 'function contentHasImage(content) {\n\tif (!Array.isArray(content)) return false; // ' + CONTENT_HAS_IMAGE_GUARD_MARKER + ' (callers pass message.content / block.content which may be undefined; non-array holds no image)\n\treturn content.some(';
 
 // dsh-tools 家族（同 bug 类：轮内裸 result.content.some 图片扫描，非数组即崩 reading 'some'）——
 // run_code/PTC 结果 finalize 处把图片结果下沉为 user message；某 tool-result 块 content 非数组
@@ -1941,13 +1941,18 @@ function transformSkillUiZh(src, file) {
 // 进程顶爆 OOM（堆仅 150-260MB 就「Committing semi space failed」）→ 崩溃环。
 //
 // 修法（保守二级收敛，不破坏 list()/listSnapshots()/materialize 既有语义）：
-//   1) header 扫描缓存：listArtifacts 读 header 前先 stat，命中 (path,size,
-//      mtimeNs) 缓存直接复用 header（二次 list()/刷新列表零解码），未命中才
-//      读首行并写缓存。缓存为模块级 Map + FIFO 上限（跨 list() 调用生效、不随
-//      实例生命周期泄漏）；size/mtimeNs 任一变化即失效重读，不掩盖真实变更。
+//   1) header 扫描缓存：读 header 前先 stat，命中 (path,size,mtimeNs) 缓存直接
+//      复用 header（二次 list()/刷新列表零解码），未命中才读首行并写缓存。缓存为
+//      模块级 Map + FIFO 上限（跨 list() 调用生效、不随实例生命周期泄漏）；
+//      size/mtimeNs 任一变化即失效重读，不掩盖真实变更。
 //   2) 读取上限：readFirstZstdLine 累积缓冲超 256KB 仍未找到完整首帧即抛错，
-//      被 listArtifacts 既有 corrupt-guard catch 后 warn 跳过（损坏/写入中的
-//      文件不再整读进内存反复扫描），不击穿启动扫描。
+//      被 listArtifacts 既有 corrupt-guard catch 跳过（损坏/写入中的文件不再整读
+//      进内存反复扫描），不击穿启动扫描。
+//
+// rc.2 关键约束：listArtifacts 的 corrupt-guard（index.js:3043）只 `continue` 放过
+// SessionFormatUnsupportedError / SessionPersistenceCorruptionError，其余原样重抛。
+// 封顶必须抛 SessionPersistenceCorruptionError（该包 import 期即在模块作用域，
+// index.js:9），抛裸 Error 会击穿扫描——这是 K5 在 rc.2 上的唯一语义变化点。
 //
 // 幂等 marker 双点注入（模块级常量注释 + 读上限注释），锚点失配自动退役。
 // 目标：dsh-session-persistence-jsonl/lib/index.js（PERSISTENCE_PKG_REL）。
@@ -1982,25 +1987,35 @@ const SESSION_HEADER_SCAN_MODULE_INJECTION = [
   '}',
 ].join('\n');
 
-const SESSION_HEADER_SCAN_METHOD_ANCHOR = '\t/** Read and validate only the independently compressed header frame. */';
-const SESSION_HEADER_SCAN_METHOD_INJECTION = [
-  '\t/**',
-  '\t * ' + SESSION_HEADER_SCAN_MARKER + ' — stat 后命中缓存直接复用 header（size+mtimeNs',
-  '\t * 未变），未命中才读首行并写缓存；miss 路径走 readFirstZstdLine/readFirstLine',
-  '\t *（含其 256KB 读上限），解析/身份校验仍由 listArtifacts 原链路负责。',
-  '\t */',
-  '\tasync readHeaderLineCached(path, signal) {',
-  '\t\tsignal?.throwIfAborted();',
-  '\t\tconst identity = await stat(path, { bigint: true });',
-  '\t\tsignal?.throwIfAborted();',
-  '\t\tconst cached = sessionHeaderScanCacheGet(path, identity.size, identity.mtimeNs);',
-  '\t\tif (cached !== void 0) return cached;',
-  '\t\tconst first = this.compression === "zstd" ? await this.readFirstZstdLine(path, signal) : await this.readFirstLine(path, signal);',
-  '\t\tsessionHeaderScanCacheSet(path, identity.size, identity.mtimeNs, first);',
-  '\t\treturn first;',
-  '\t}',
-  '\t/** Read and validate only the independently compressed header frame. */',
-].join('\n');
+// 双世代方法锚（同一 class 体内、1-tab 缩进，两处都只作「插入点 + 需原样重发的
+// JSDoc」用）：
+//   V2（0.1.5-rc.1 起、rc.2 唯一在位）——readGenerationHeader 的 JSDoc；
+//   V1（0.1.6 及更早）——readFirstZstdLine 的 JSDoc，rc.2 已删该措辞（0 命中）。
+// 顺序 V2 在前：0.1.6 两枚都在，选 V2 使注入体紧邻唯一的调用点（readGenerationHeader
+// 内），与 rc.2 形态一致；末行按命中的那枚逐字重发，原方法的 JSDoc 不会挪花。
+const SESSION_HEADER_SCAN_METHOD_ANCHOR_RC2 = '\t/** Read and translate one selected generation header without inspecting its body. */';
+const SESSION_HEADER_SCAN_METHOD_ANCHOR_V1 = '\t/** Read and validate only the independently compressed header frame. */';
+const SESSION_HEADER_SCAN_METHOD_ANCHORS = [SESSION_HEADER_SCAN_METHOD_ANCHOR_RC2, SESSION_HEADER_SCAN_METHOD_ANCHOR_V1];
+function sessionHeaderScanMethodInjection(jsdoc) {
+  return [
+    '\t/**',
+    '\t * ' + SESSION_HEADER_SCAN_MARKER + ' — stat 后命中缓存直接复用 header（size+mtimeNs',
+    '\t * 未变），未命中才读首行并写缓存；miss 路径走 readFirstZstdLine/readFirstLine',
+    '\t *（含其 256KB 读上限），解析/身份校验仍由 listArtifacts 原链路负责。',
+    '\t */',
+    '\tasync readHeaderLineCached(path, signal) {',
+    '\t\tsignal?.throwIfAborted();',
+    '\t\tconst identity = await stat(path, { bigint: true });',
+    '\t\tsignal?.throwIfAborted();',
+    '\t\tconst cached = sessionHeaderScanCacheGet(path, identity.size, identity.mtimeNs);',
+    '\t\tif (cached !== void 0) return cached;',
+    '\t\tconst first = this.compression === "zstd" ? await this.readFirstZstdLine(path, signal) : await this.readFirstLine(path, signal);',
+    '\t\tsessionHeaderScanCacheSet(path, identity.size, identity.mtimeNs, first);',
+    '\t\treturn first;',
+    '\t}',
+    jsdoc,
+  ].join('\n');
+}
 
 // 0.1.5-rc.1 重锚：listArtifacts 首行读取改经 readGenerationHeader(selected)，
 // 读取对象为 selected.sourcePath（原 path 参数名）。
@@ -2013,16 +2028,18 @@ const SESSION_HEADER_SCAN_CAP_ANCHOR = '\t\t\t\tcontent = Buffer.concat([content
 const SESSION_HEADER_SCAN_CAP_INJECTION = [
   '\t\t\t\tcontent = Buffer.concat([content, chunk.subarray(0, bytesRead)]);',
   '\t\t\t\t// ' + SESSION_HEADER_SCAN_MARKER + ' — 累积缓冲封顶：损坏/写入中的日志不再被整读进',
-  '\t\t\t\t// 内存反复扫描（listArtifacts 的 corrupt-guard catch 后 warn 跳过，不击穿启动扫描）。',
-  '\t\t\t\tif (content.length > ZSTD_HEADER_SCAN_MAX_BYTES) throw new Error(`corrupt Zstandard session log: no complete header frame within ${ZSTD_HEADER_SCAN_MAX_BYTES} bytes`);',
+  '\t\t\t\t// 内存反复扫描。错误类型必须是 SessionPersistenceCorruptionError——listArtifacts 的',
+  '\t\t\t\t// corrupt-guard 只对该类与 SessionFormatUnsupportedError 跳过，裸 Error 会击穿启动扫描。',
+  '\t\t\t\tif (content.length > ZSTD_HEADER_SCAN_MAX_BYTES) throw new SessionPersistenceCorruptionError(`corrupt Zstandard session log: no complete header frame within ${ZSTD_HEADER_SCAN_MAX_BYTES} bytes (raw log: ${path})`);',
 ].join('\n');
 
 function transformSessionHeaderScanGuard(src, file) {
   if (src.includes(SESSION_HEADER_SCAN_MARKER)) return { status: 'already' };
+  const methodAnchor = SESSION_HEADER_SCAN_METHOD_ANCHORS.find((a) => src.includes(a));
   const missing = [];
   if (!src.includes(SESSION_HEADER_SCAN_MODULE_ANCHOR)) missing.push('module anchor (isENOENT)');
-  if (!src.includes(SESSION_HEADER_SCAN_METHOD_ANCHOR)) missing.push('readFirstZstdLine JSDoc');
-  if (!src.includes(SESSION_HEADER_SCAN_READ_EXPR)) missing.push('listArtifacts read expression');
+  if (methodAnchor === void 0) missing.push('generation-header/readFirstZstdLine JSDoc');
+  if (!src.includes(SESSION_HEADER_SCAN_READ_EXPR)) missing.push('readGenerationHeader read expression');
   if (!src.includes(SESSION_HEADER_SCAN_CAP_ANCHOR)) missing.push('readFirstZstdLine concat');
   if (missing.length > 0) {
     return { status: 'anchor-missing', detail: '未找到 session header scan 锚点（版本可能已变更）：' + missing.join(' / ') + '，跳过 ' + file };
@@ -2031,7 +2048,7 @@ function transformSessionHeaderScanGuard(src, file) {
   // 函数替换器：注入文本含 ${...} 模板字面量，规避 String.replace 对 $ 序列的替换语义。
   out = out.replace(SESSION_HEADER_SCAN_READ_EXPR, () => SESSION_HEADER_SCAN_CACHED_CALL);
   out = out.replace(SESSION_HEADER_SCAN_MODULE_ANCHOR, () => SESSION_HEADER_SCAN_MODULE_INJECTION + '\n\n' + SESSION_HEADER_SCAN_MODULE_ANCHOR);
-  out = out.replace(SESSION_HEADER_SCAN_METHOD_ANCHOR, () => SESSION_HEADER_SCAN_METHOD_INJECTION);
+  out = out.replace(methodAnchor, () => sessionHeaderScanMethodInjection(methodAnchor));
   out = out.replace(SESSION_HEADER_SCAN_CAP_ANCHOR, () => SESSION_HEADER_SCAN_CAP_INJECTION);
   return { status: 'changed', src: out };
 }
@@ -2372,6 +2389,11 @@ const WORKSPACE_CHIP_LABEL_MARKER = 'dsh-desktop fix: workspace chip keeps cwd l
 // 逐字一致，全文件唯一命中，三 tab 缩进）。
 const WORKSPACE_CHIP_LABEL_ANCHOR = '\t\t\tconst chipTitle = pendingWorkspace?.title ?? (sessionId === void 0 ? void 0 : sessionWorkspace?.title ?? (workspaces.phase === "ready" || cwd === void 0 || cwd === "" ? void 0 : workspaceLabel(cwd)));';
 const WORKSPACE_CHIP_LABEL_NEW = '\t\t\tconst chipTitle = pendingWorkspace?.title ?? (sessionId === void 0 ? void 0 : sessionWorkspace?.title ?? (cwd === void 0 || cwd === "" ? void 0 : workspaceLabel(cwd)));';
+// 0.2.0-rc.2 把同一表达式拆成 storedChipTitle + chipTitle 两行（新增的
+// workspaceDisplayTitle 只把 "default-workspace" 映射成本地化默认名），phase 门槛
+// 原样保留 → 缺陷仍然成立。两代锚点各配一对，任一命中即打补丁。
+const WORKSPACE_CHIP_LABEL_ANCHOR_V2 = '\t\t\tconst storedChipTitle = pendingWorkspace?.title ?? (sessionId === void 0 ? void 0 : sessionWorkspace?.title ?? (workspaces.phase === "ready" || cwd === void 0 || cwd === "" ? void 0 : workspaceLabel(cwd)));';
+const WORKSPACE_CHIP_LABEL_NEW_V2 = '\t\t\tconst storedChipTitle = pendingWorkspace?.title ?? (sessionId === void 0 ? void 0 : sessionWorkspace?.title ?? (cwd === void 0 || cwd === "" ? void 0 : workspaceLabel(cwd)));';
 // 机械可逆（inverse-replace）：NEW → ANCHOR 即回滚，注释块按 marker 定位挖除。
 const WORKSPACE_CHIP_LABEL_COMMENTS = [
   '// ' + WORKSPACE_CHIP_LABEL_MARKER,
@@ -2384,15 +2406,20 @@ const WORKSPACE_CHIP_LABEL_COMMENTS = [
   '// turned inert. Keeping the cwd fallback covers the gap, while sessions with',
   '// no cwd still collapse to undefined through the remaining two terms.',
 ];
-const WORKSPACE_CHIP_LABEL_INJECTION = WORKSPACE_CHIP_LABEL_COMMENTS
-  .map((line) => '\t\t\t' + line).join('\n') + '\n' + WORKSPACE_CHIP_LABEL_NEW;
+const WORKSPACE_CHIP_LABEL_INJECTION_FOR = (patchedLine) => WORKSPACE_CHIP_LABEL_COMMENTS
+  .map((line) => '\t\t\t' + line).join('\n') + '\n' + patchedLine;
 
 function transformWorkspaceChipLabelHold(src, file) {
   if (src.includes(WORKSPACE_CHIP_LABEL_MARKER)) return { status: 'already' };
-  if (!src.includes(WORKSPACE_CHIP_LABEL_ANCHOR)) {
-    return { status: 'anchor-missing', detail: '未找到 chipTitle 的 workspaces.phase gate 锚点（版本可能已变化），跳过 ' + file };
+  for (const [anchor, patched] of [
+    [WORKSPACE_CHIP_LABEL_ANCHOR, WORKSPACE_CHIP_LABEL_NEW],
+    [WORKSPACE_CHIP_LABEL_ANCHOR_V2, WORKSPACE_CHIP_LABEL_NEW_V2],
+  ]) {
+    if (src.includes(anchor)) {
+      return { status: 'changed', src: src.replace(anchor, () => WORKSPACE_CHIP_LABEL_INJECTION_FOR(patched)) };
+    }
   }
-  return { status: 'changed', src: src.replace(WORKSPACE_CHIP_LABEL_ANCHOR, () => WORKSPACE_CHIP_LABEL_INJECTION) };
+  return { status: 'anchor-missing', detail: '未找到 chipTitle 的 workspaces.phase gate 锚点（V1/V2 双形态均未命中，版本可能已变化），跳过 ' + file };
 }
 
 // ---------------------------------------------------------------------------
@@ -2411,9 +2438,11 @@ function transformWorkspaceChipLabelHold(src, file) {
 // 新增哨兵时只需在此登记该补丁的正向替换对。
 // ---------------------------------------------------------------------------
 const PRISTINE_INJECTIONS = {
-  // device-auth 指引：V2（rc.1+，3-tab if 体 → 4-tab 指引）与 V1（rc.8 及更早）
-  // 两形态都登记，revert 时按存在者命中。
+  // device-auth 指引：V3（0.2.0-rc.2+，providerError/errorMessage 形态）、
+  // V2（rc.1+，3-tab if 体 → 4-tab 指引）与 V1（rc.8 及更早）三形态都登记，
+  // revert 时按存在者命中。
   'device-auth-guidance': [
+    [DEVICE_AUTH_THROW_ANCHOR_V3, DEVICE_AUTH_THROW_REPLACEMENT_V3],
     [DEVICE_AUTH_THROW_ANCHOR_V2, DEVICE_AUTH_THROW_ANCHOR_V2 + '\n' + deviceAuthGuidanceBlock('\t\t\t\t')],
     [DEVICE_AUTH_THROW_ANCHOR, DEVICE_AUTH_THROW_ANCHOR + '\n' + deviceAuthGuidanceBlock('\t\t\t')],
   ],
@@ -2454,10 +2483,12 @@ const PRISTINE_INJECTIONS = {
   ],
   'session-header-scan-guard': [
     // 改写型对（NEW 比 OLD 短）与三处追加型注入同列；顺序：先复原调用点，
-    // 再剥含 OLD 文本的方法体，避免误命中。
+    // 再剥含 OLD 文本的方法体，避免误命中。方法锚两世代各登记一对，循环只剥
+    // 在位的那枚（rc.2 只有 V2，0.1.6 两枚都在但应用时恒选 V2）。
     [SESSION_HEADER_SCAN_READ_EXPR, SESSION_HEADER_SCAN_CACHED_CALL],
     [SESSION_HEADER_SCAN_MODULE_ANCHOR, SESSION_HEADER_SCAN_MODULE_INJECTION + '\n\n' + SESSION_HEADER_SCAN_MODULE_ANCHOR],
-    [SESSION_HEADER_SCAN_METHOD_ANCHOR, SESSION_HEADER_SCAN_METHOD_INJECTION],
+    [SESSION_HEADER_SCAN_METHOD_ANCHOR_RC2, sessionHeaderScanMethodInjection(SESSION_HEADER_SCAN_METHOD_ANCHOR_RC2)],
+    [SESSION_HEADER_SCAN_METHOD_ANCHOR_V1, sessionHeaderScanMethodInjection(SESSION_HEADER_SCAN_METHOD_ANCHOR_V1)],
     [SESSION_HEADER_SCAN_CAP_ANCHOR, SESSION_HEADER_SCAN_CAP_INJECTION],
   ],
   'session-load-graceful': [
@@ -2630,8 +2661,7 @@ module.exports = {
   transformSessionUnknownEventTolerance,
   transformProfilePatchGuard,
   transformProfileBundleAppBoot,
-  transformProfileBundleProfileBoot,
-  transformSettingsSectionGuard,
+  transformProfilePatchLayerGuard,
   transformManualSortFix,
   transformPluginInventoryTabMergeFix,
   // 持久 shell 停止修复（abort race + 中断升级）。
@@ -2641,8 +2671,8 @@ module.exports = {
   transformAgentPresetFallback,
   // dsh-system-prompt 字面量透传（graph-memory {{state.gold}} 模板注入瘫会话修复）。
   transformPromptContextLiteral,
-  // K1（credentials service is absent 偶发）三层修复。
-  transformFallbackHealIsolation,
+  // K1（credentials service is absent 偶发）两层修复（第三层 fallback-heal 已随
+  // rc.2 删除 heal 子系统而退役）。
   transformCredentialsInitialRetry,
   transformCredentialsAbsentGuidance,
   // 设备未授权（DeepSeek 服务端风控 403）报文追加可操作指引。
@@ -2691,9 +2721,7 @@ module.exports = {
     patchPiAiCredits,
     patchPiAiReasoningDefaults,
     patchPiAiOverflowMessage,
-    patchAtomicWriteOrphanLock,
     patchSettingsModelsResilience,
-    patchModelImageInput,
     patchBundleArrivalRetry,
     patchSchedulerGuard,
     patchEmptyToolName,
@@ -2715,14 +2743,12 @@ module.exports = {
     SLOT_ERROR_ISOLATE_MARKER_V2,
     PROFILE_PATCH_GUARD_MARKER,
     PROFILE_BUNDLE_GUARD_MARKER,
-    PROFILE_BOOT_GUARD_MARKER,
-    SETTINGS_SECTION_MARKER,
+    APP_BOOT_PATCH_LAYER_GUARD_MARKER,
     PLUGIN_INVENTORY_TAB_MARKER,
     PERSISTENT_ABORT_RACE_MARKER,
     INTERRUPT_ESCALATION_MARKER,
     AGENT_PRESET_FALLBACK_MARKER,
     PROMPT_CONTEXT_LITERAL_MARKER,
-    FALLBACK_HEAL_ISOLATION_MARKER,
     CREDENTIALS_INITIAL_RETRY_MARKER,
     CREDENTIALS_ABSENT_GUIDANCE_MARKER,
     DEVICE_AUTH_GUIDANCE_MARKER,

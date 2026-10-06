@@ -283,14 +283,21 @@ test('幂等：第二遍 already / marker-only 短路 / 锚点缺失 anchor-miss
 // ---------------------------------------------------------------------------
 // 4：行为（动态 import 真实内核 transform 产物）。
 // ---------------------------------------------------------------------------
+//
+// 帧体一律用 turn: 1 而非 0：0.2.0-rc.2 的 v3→v4 迁移校验器从 nextTurn = 1 起算
+// （@deepseek-ai/dsh-session-format-v3-to-v4/lib/index.js:544，判据在 :747
+// `data["turn"] !== this.nextTurn` → SessionFormatError）。turn: 0 会让这条格式
+// 校验抢在被测分支之前失败：干净日志直接抛错，损坏帧用例则把降级原因换成
+// 「turn/start does not open the expected turn」而 seq 断档/撕裂那两腿根本没走到
+// ——绿灯是假的。夹具必须先合法，测的才是它声明的那条腿。
 
 test('干净日志：正常读回事件、无 tornMarker', async (t) => {
   const mod = await loadTransformedKernel(t);
   const backend = Object.create(persistenceClassOf(mod).prototype);
   const hf = frame(headerLine());
   const ef = frame(
-    JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 0 } }) + '\n' +
-    JSON.stringify({ type: 'turn/end', seq: 1, time: 2, data: { turn: 0, reason: { kind: 'completed' } } }) + '\n',
+    JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }) + '\n' +
+    JSON.stringify({ type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } }) + '\n',
   );
   const result = await backend.readZstdPrefix(Buffer.concat([hf, ef]), undefined);
   assert.deepEqual(result.events.map((e) => e.type), ['turn/start', 'turn/end']);
@@ -312,7 +319,7 @@ test('seq 断档损坏帧：优雅降级为扁平 tornTruncateTo、不抛致命�
   const hf = frame(headerLine());
   // seq=5 与 scanner 期望的 seq=0 断档 → SessionLogScanner 标记 issue →
   // 帧级 committedBytes !== inputBytes → 原实现抛「complete frame contains a torn JSONL record」。
-  const ef = frame(JSON.stringify({ type: 'turn/start', seq: 5, time: 1, data: { turn: 0 } }) + '\n');
+  const ef = frame(JSON.stringify({ type: 'turn/start', seq: 5, time: 1, data: { turn: 1 } }) + '\n');
   const warns = [];
   const originalWarn = console.warn;
   console.warn = (msg) => { warns.push(String(msg)); };
@@ -326,6 +333,11 @@ test('seq 断档损坏帧：优雅降级为扁平 tornTruncateTo、不抛致命�
     assert.deepEqual(result.recoveredTail, []);
     assert.equal(warns.length, 1, '降级应 emit 一条 console.warn 告警');
     assert.ok(warns[0].includes('degraded session load to last complete frame'), '告警应含降级文案');
+    // 反证（防假绿）：告警必须带上「帧内 JSONL 撕裂」这条真实诱因。夹具一旦退回
+    // turn: 0，rc.2 的迁移校验会先抛 SessionFormatError，降级照样发生、断言照样绿，
+    // 但被测的 seq 断档那条腿根本没走到——只有钉住诱因才分得清是哪条腿触发的。
+    assert.match(warns[0], /complete frame contains a torn JSONL record/,
+      '降级诱因应是 seq 断档导致的帧内撕裂，不得被格式校验错误抢先');
   } finally {
     console.warn = originalWarn;
   }
@@ -336,7 +348,7 @@ test('结构撕裂最后一帧回归：既有 torn-tail 恢复仍生效（无致
   const backend = Object.create(persistenceClassOf(mod).prototype);
   const hf = frame(headerLine());
   // 完整 turn/start 帧后接一个被截断的帧（结构撕裂）。
-  const ef = frame(JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 0 } }) + '\n');
+  const ef = frame(JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }) + '\n');
   const torn = ef.subarray(0, ef.length - 10);
   const result = await backend.readZstdPrefix(Buffer.concat([hf, torn]), undefined);
   assert.ok(Array.isArray(result.events), '结构撕裂帧不得导致抛错');
@@ -368,10 +380,10 @@ test('中帧损坏（末帧之前）：仍硬抛，不得降级截盘销毁其�
   const mod = await loadTransformedKernel(t);
   const backend = Object.create(persistenceClassOf(mod).prototype);
   const hf = frame(headerLine());
-  const goodFrame = frame(JSON.stringify({ type: 'turn/end', seq: 9, time: 3, data: { turn: 0, reason: { kind: 'completed' } } }) + '\n');
+  const goodFrame = frame(JSON.stringify({ type: 'turn/end', seq: 9, time: 3, data: { turn: 1, reason: { kind: 'completed' } } }) + '\n');
   const cases = [
-    ['结构完整但帧内 JSONL 撕裂', frame(JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 0 } }) + '\n{"type":"assistant/message","seq":1')],
-    ['结构完整但 seq 断档', frame(JSON.stringify({ type: 'turn/start', seq: 5, time: 1, data: { turn: 0 } }) + '\n')],
+    ['结构完整但帧内 JSONL 撕裂', frame(JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }) + '\n{"type":"assistant/message","seq":1')],
+    ['结构完整但 seq 断档', frame(JSON.stringify({ type: 'turn/start', seq: 5, time: 1, data: { turn: 1 } }) + '\n')],
   ];
   for (const [name, midBad] of cases) {
     const warns = [];
@@ -408,12 +420,19 @@ test('回归：叠加 torn-tail/corrupt-guard/K5 后本补丁仍命中、三 mar
   assert.ok(out.includes(CORRUPT_MARKER), 'corrupt-guard marker 应保留');
   assert.ok(out.includes(K5_MARKER), 'K5 header 扫描缓存 marker 应保留');
   assert.ok(out.includes(MARKER), '本补丁 marker 应存在');
-  // rc.1 形态：corrupt-guard 不再注入独立的 `catch (corruptError)` 块（alpha.5 形
-  // 态），而是改写 listArtifacts 既有的 `catch (error)`——保留 SessionFormatUnsup‐
-  // portedError 先行 continue，其余错误告警 + continue。三要素等价判定：
+  // rc.2 形态：corrupt-guard 不注入独立的 `catch (corruptError)` 块（alpha.5 形
+  // 态），而是改写 listGenerations 既有的 `catch (error)`——保留内核自己的「白名单
+  // 类先行 continue」那行，再补告警 + continue。rc.2 把白名单从单类
+  // （SessionFormatUnsupportedError）扩成两类（|| SessionPersistenceCorruptionError，
+  // 后者是 rc.1 起 header 扫描越界/撕裂抛的损坏类），断言按可选两类别形态匹配，
+  // 并单独钉住第二类必须在内——漏了它，header 撕裂的会话会把启动扫描整个击穿。
   assert.ok(
-    /} catch \(error\) \{\n\t+if \(error instanceof SessionFormatUnsupportedError\) continue;\n\t+\/\/ dsh-desktop-corrupt-guard-v1/.test(out),
+    /try \{\n\t+header = await this\.readGenerationHeader\(selected, void 0, signal\);\n\t+\} catch \(error\) \{\n\t+if \(error instanceof SessionFormatUnsupportedError(?: \|\| error instanceof SessionPersistenceCorruptionError)?\) continue;\n\t+\/\/ dsh-desktop-corrupt-guard-v1/.test(out),
     'corrupt-guard 应改写在既有 catch(error) 且保留格式版本先行 continue',
+  );
+  assert.ok(
+    out.includes('error instanceof SessionPersistenceCorruptionError) continue;'),
+    'rc.2 白名单必须含 SessionPersistenceCorruptionError（单类别 continue 是 rc.1 前的旧形态）',
   );
   assert.ok(out.includes('skipping corrupt session log'), 'corrupt-guard warn 跳过文案应保留');
   assert.match(out, /skipping corrupt session log[^\n]*\n\t+continue;/, 'corrupt-guard 告警后应 continue 跳过该会话');

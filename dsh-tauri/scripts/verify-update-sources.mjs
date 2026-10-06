@@ -14,8 +14,10 @@
 // 检查项：
 //   1. GitHub releases/latest 与 Gitee releases/latest 的 tag 必须一致
 //      （不一致 = 镜像漂移，硬错）；--expect-version 给出时两侧都必须等于它。
-//   2. 资产对照表：Gitee 缺失 >100MB 主资产属预期（Gitee 单附件上限，
-//      壳侧回落 GitHub 源）；缺失小资产 = WARN；Gitee 多出的 tag 源码包
+//   2. 资产对照表：>100MB 主资产在 Gitee 侧必须以完整连续的 `<名>.partN` 分片
+//      镜像（Gitee 单附件上限；GitHub 不可达的用户只能靠这套分片更新，所以
+//      无分片/断号/逐片 HEAD 求和不等于 GitHub size 一律 FAIL，不是回落豁免）；
+//      缺失未超限小资产 = WARN；Gitee 多出的 tag 源码包
 //      （v*.zip / v*.tar.gz）属平台行为，不算异常。
 //   3. 每个 GitHub 主资产：
 //      - 有 .sha256 边车 → 下载边车校验格式（首段 64 位小写 hex），并与

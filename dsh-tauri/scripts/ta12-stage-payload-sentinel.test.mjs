@@ -34,7 +34,6 @@ test('前置校验清单（脚本 for f in …）全部在 dsh-desktop/ 在位',
     'vendor/node/node.exe',            // Windows（含 Git Bash）分支的 NODE_BIN
     'node_modules/@deepseek-ai/dsh/lib/bin.js',
     'scripts/lib/companion-profile.js',
-    'assets/plugins',
   ];
   const missing = required.filter((f) => !fs.existsSync(path.join(SRC, f)));
   assert.deepEqual(missing, [], 'stage-payload 前置必需件缺失: ' + missing.join(', '));
@@ -71,17 +70,55 @@ test('devDeps 排除清单与 node_modules 现状一致（electron* 不进 paylo
   assert.equal(m[1], 'electron electron-builder electron-winstaller');
 });
 
-test('assets 镜像只剔「gitignored 插件依赖树」（正件 node_modules 必须留在包里）', () => {
-  // v0.6.2 本地构建实测：插件目录里本机 pnpm install 出的 .pnpm 存储被 robocopy
-  // 跟 junction 展开后，NSIS 的 File 指令在 >260 字符路径上 failed opening file
-  // → 建包中断。但“assets 一刀切 /XD node_modules”是错法：dsh-hub(731 个跟踪
-  // 文件) / graph-memory(1177) / billion-context-dsh(165) 的 node_modules 是 git
-  // 跟踪进来的运行期依赖，剔掉就是装完即挂。
-  assert.ok(/mirror_dir "\$SRC\/assets" "\$DST\/assets" \/\/XD \.pnpm/.test(sh),
-    'assets 镜像应只 //XD .pnpm');
-  assert.ok(!/mirror_dir "\$SRC\/assets"[^\n]*\/\/XD node_modules/.test(sh),
-    '不得对 assets 一刀切排除 node_modules——会误杀正件插件的运行期依赖');
-  // 残留判定必须走 git，而不是写死插件名单（新增插件无需改脚本）。
-  assert.ok(/ls-files -- "dsh-desktop\/assets\/plugins\/\$name\/node_modules"/.test(sh),
-    '应按 git 跟踪状态逐个判定本机安装残留');
+// ---------------------------------------------------------------------------
+// v1.0.0 纯净线：内置插件与随包预设不进安装包（口径 = 三层，缺一层即形态漂移）
+// ---------------------------------------------------------------------------
+
+/** 把 stage-payload.sh 源码按纯净线三层判据走一遍，返回违规清单（空 = 合规）。 */
+function pureShapeViolations(src) {
+  const v = [];
+  const m = /mirror_dir "\$SRC\/assets" "\$DST\/assets"([^\n]*)/.exec(src);
+  if (!m) {
+    v.push('解析不到 assets 镜像行');
+    return v;
+  }
+  const excluded = m[1];
+  for (const want of ['plugins', 'agent-presets']) {
+    if (!excluded.includes(want)) v.push(`assets 镜像未 //XD ${want}`);
+  }
+  if (!/^rm -rf "\$DST\/assets\/plugins" "\$DST\/assets\/agent-presets"$/m.test(src)) {
+    v.push('缺平台无关的镜像后显式 rm');
+  }
+  if (!/for d in assets\/plugins assets\/agent-presets; do/.test(src)) {
+    v.push('缺 payload 纯净形态门禁');
+  }
+  if (/\bnode_modules\b/.test(excluded)) v.push('对 assets 一刀切排除 node_modules');
+  return v;
+}
+
+test('纯净线：assets 镜像排除内置插件与预设 + 镜像后显式 rm + 收尾门禁，三层齐备', () => {
+  assert.deepEqual(pureShapeViolations(sh), [], 'stage-payload.sh 纯净线口径不完整');
+});
+
+test('反证：纯净线判据每一项都真的有捕获力（逐项拆掉必须变红）', () => {
+  const mutants = [
+    ['丢掉 //XD plugins', (s) => s.replace('//XD .pnpm plugins agent-presets', '//XD .pnpm agent-presets')],
+    ['丢掉镜像后的显式 rm', (s) => s.replace(/^rm -rf "\$DST\/assets\/plugins".*$/m, '# (removed)')],
+    ['丢掉收尾门禁', (s) => s.replace(/for d in assets\/plugins assets\/agent-presets; do/, 'for d in ; do')],
+    ['一刀切排除 node_modules（会误杀正件插件运行期依赖）',
+      (s) => s.replace('//XD .pnpm plugins agent-presets', '//XD .pnpm node_modules plugins agent-presets')],
+  ];
+  for (const [label, mutate] of mutants) {
+    const mutated = mutate(sh);
+    assert.notEqual(mutated, sh, `反证夹具无效：变异未改变源码（${label}）`);
+    assert.notDeepEqual(pureShapeViolations(mutated), [], `判据对「${label}」无捕获力`);
+  }
+});
+
+test('assets 镜像保留 .pnpm 排除（NSIS >260 字符路径中断建包的回归防线）', () => {
+  const m = /mirror_dir "\$SRC\/assets" "\$DST\/assets"([^\n]*)/.exec(sh);
+  assert.ok(m, 'assets 镜像行形态改变时请同步本哨兵');
+  assert.ok(m[1].includes('.pnpm'), 'assets 镜像仍须 //XD .pnpm');
+  assert.ok(/find "\$DST\/assets" -type d -name \.pnpm/.test(sh),
+    '/XD 挡住的目录连 /MIR 删除也一并挡了，.pnpm 残留仍需显式清理');
 });

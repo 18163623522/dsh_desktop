@@ -1,22 +1,31 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// TA6 元测试 6：64 补丁 × 双版本形态判定矩阵（基线快照，最有长期价值）。
+// TA6 元测试 6：59 补丁 × pristine 内核形态判定矩阵（基线快照，长期价值最高）。
 //
-// 对两个 pristine 内核源各跑一遍全部 transform（按 registry order）：
-//   - 形态 rc.2：.tmp-rc2-stage/node_modules（npm 闭包解包，未打任何补丁）；
-//   - 形态 rc.1（旧线形态代表，任务书称 rc.8 线）：.tmp-rc1-stage/rc1/package
-//     （dsh 主包 0.1.1-rc.1 解包；其余包未装配，目标缺失记 target-absent）。
-// 注意：dsh-desktop/node_modules 与 dsh-tauri payload 是 postinstall 已打补丁
-// 树，不能作 pristine 源。
+// 对 pristine 内核闭包按 registry order 编排序跑一遍全部 file transform——同文件
+// 多补丁时，后一条的输入就是前一条的产物，判定与引擎真实顺序一致；root 规格记
+// 'root'（root 应用器不在本判定面，由 unit-patch-deps-coverage /
+// ta6-heal-rollback-audit 覆盖）；靶不在离线闭包内的记 'target-absent'。
 //
-// 输出「补丁 × 形态 → changed/already/anchor-missing/target-absent/root」矩阵，
-// 与下方 BASELINE 内联快照逐项比对：未来内核升级 / 锚点漂移时，失败信息即
-// 完整 diff —— 哪些补丁从 changed 变 anchor-missing（锚点漂移面）、哪些从
-// anchor-missing 变 already（上游原生内置、补丁自然退役）一目了然。
+// 形态源（0.2.0-rc.2 随迁收口）：以前挂两株手工搭的 stage 树（.tmp-rc2-stage /
+// .tmp-rc1-stage/rc1），换代会双双失联、矩阵整片 skip —— 那就是假绿位点。现在
+// 只有一株：scripts/lib/pristine-kernel-roots.js 解析出的
+// .tmp-kernel/.consumer-<pin>/node_modules（由 scripts/install-pristine-kernel.mjs
+// 从 vendor/dsh-kernel 的离线 tarball 装出，与 kernel-pin 同版才有意义）。树不在
+// 场时本测试**直接失败并给出安装命令**，绝不 skip：漂移哨兵静默挂起等于没有。
 //
-// 依赖链：vision 系（toggle/key）按 order 在 image-send 之后跑，矩阵记录的是
-// 引擎真实编排序下的判定，而非裸序。
+// 靶解析口径：一律拼到 <root>/@deepseek-ai/<pkgRel>（pkgRel 自带 @deepseek-ai/
+// 前缀时先剥掉，避免历史上「双前缀 0 命中」把已命中伪装成 target-absent）。
+// **绝不允许回退到 dsh-desktop/node_modules**——那是 postinstall 已打补丁树，
+// 回退会把 target-absent 洗成 already，正是旧注释点名的假绿来源。非 @deepseek-ai
+// scope 的靶（@openai/codex、@earendil-works/pi-ai）本就不在离线闭包内 → 恒
+// target-absent，其真实字节判定各归自己的单测（见 BASELINE 行内注释）。
+//
+// 内核升级后 diff 此矩阵即知漂移面：changed → anchor-missing = 锚点漂移（重锚或
+// 退役）；changed/anchor-missing → already = 上游原生内置，补丁自然退役。修改
+// BASELINE = 显式接受新基线；BASELINE 的版本键必须等于 kernel-pin，否则本测试拒绝
+// 通过——不许静默沿用旧代数值。
 // ---------------------------------------------------------------------------
 
 const test = require('node:test');
@@ -25,365 +34,223 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { PATCH_SPECS } = require('../lib/patch-registry');
+const { pristineRoots } = require('../lib/pristine-kernel-roots');
+const { kernel } = require('../compat/kernel-pin.json');
 
-const FORM_ROOTS = {
-  'rc.2': [
-    path.join(__dirname, '..', '..', '..', '.tmp-rc2-stage', 'node_modules'),
-  ],
-  // 旧线形态（任务书 rc.8 线的本地可得代表 = rc.1 主包解包树）。
-  'rc.1': [
-    path.join(__dirname, '..', '..', '..', '.tmp-rc1-stage', 'rc1', 'package'),
-  ],
-};
+const FORM = kernel.packageVersion;
+// 规格总数计数锁。沿革：64（0.1.x 线）→ 59 = 64 − 0.2.0-rc.2 重靶期退役 6 项
+// （loader-tree-isolation / fallback-heal-isolation / settings-section-guard /
+// atomic-write-orphan-lock / model-image-input / profile-bundle-guard-profileboot）
+// + 1 项取代新增（profile-patch-layer-guard，order 130，readProfilePatches 层）。
+// 逐项理由见 ta6-registry-invariants.test.js 的 E。
+const SPEC_COUNT = 59;
 
-function formRoot(form) {
-  for (const r of FORM_ROOTS[form]) if (fs.existsSync(r)) return r;
-  return null;
+/** 与 kernel-pin 同版的 pristine 闭包根；不在场返回 null（调用侧响亮失败）。 */
+function formRoot() {
+  return pristineRoots().find((r) => r.includes(FORM)) || null;
 }
 
-function targetFile(form, root, spec) {
+/** 靶解析：root/@deepseek-ai/<pkgRel>；多 pkgRels 取第一个在场者。 */
+function targetFile(root, spec) {
   if (spec.kind !== 'file') return null;
-  const joinUnder = form === 'rc.2'
-    ? (rel) => path.join(root, '@deepseek-ai', rel)
-    // rc.1 根即 dsh 主包解包目录：pkgRel 去掉首段包名 'dsh' 后拼入。
-    : (rel) => {
-      const parts = rel.split(path.sep);
-      if (parts[0] !== 'dsh') return null;
-      return path.join(root, ...parts.slice(1));
-    };
-  if (spec.layout === 'profile-boot-dirs') {
-    const lib = form === 'rc.2'
-      ? path.join(root, '@deepseek-ai', 'dsh', 'lib')
-      : path.join(root, 'lib');
-    try {
-      const files = fs.readdirSync(lib).filter((f) => /^profile-boot-.*\.js$/.test(f));
-      return files.length ? path.join(lib, files[0]) : null;
-    } catch { return null; }
-  }
   const rels = spec.pkgRels && spec.pkgRels.length ? spec.pkgRels : [spec.pkgRel];
   for (const rel of rels) {
-    const p = joinUnder(rel);
-    if (p && fs.existsSync(p)) return p;
+    if (!rel) continue;
+    const norm = String(rel).replace(/^@deepseek-ai[\\/]/, '');
+    const p = path.join(root, '@deepseek-ai', norm);
+    if (fs.existsSync(p)) return p;
   }
   return null;
 }
 
-/** 计算当前矩阵（rc.2 按 order 顺序跑，模拟引擎编排序：先应用者产物即
- * 后续补丁的输入——同文件多补丁时判定真实；不同文件互不影响）。 */
-function computeMatrix() {
+/** 计算当前形态矩阵（按 order 编排序，先应用者产物即后续补丁的输入）。 */
+function computeMatrix(root) {
   const ordered = PATCH_SPECS.slice().sort((a, b) => a.order - b.order);
-  const matrix = {};
-  for (const form of Object.keys(FORM_ROOTS)) {
-    const root = formRoot(form);
-    matrix[form] = {};
-    const fileState = new Map(); // file -> 当前内容（编排序累积）
-    if (!root) { for (const s of ordered) matrix[form][s.id] = 'form-unavailable'; continue; }
-    for (const spec of ordered) {
-      if (spec.kind === 'root') { matrix[form][spec.id] = 'root'; continue; }
-      const file = targetFile(form, root, spec);
-      if (!file) { matrix[form][spec.id] = 'target-absent'; continue; }
-      const src = fileState.has(file) ? fileState.get(file) : fs.readFileSync(file, 'utf8');
-      let status;
-      try {
-        const r = spec.transform(src, file);
-        status = r.status;
-        if (r.status === 'changed') fileState.set(file, r.src);
-      } catch (err) {
-        status = 'THROW:' + err.message;
-      }
-      matrix[form][spec.id] = status;
+  const row = {};
+  const fileState = new Map();
+  for (const spec of ordered) {
+    if (spec.kind === 'root') { row[spec.id] = 'root'; continue; }
+    const file = targetFile(root, spec);
+    if (!file) { row[spec.id] = 'target-absent'; continue; }
+    const src = fileState.has(file) ? fileState.get(file) : fs.readFileSync(file, 'utf8');
+    try {
+      const r = spec.transform(src, file);
+      row[spec.id] = r.status;
+      if (r.status === 'changed') fileState.set(file, r.src);
+    } catch (err) {
+      row[spec.id] = 'THROW:' + err.message;
     }
   }
-  return matrix;
+  return row;
+}
+
+/** 快照 vs 现算的逐项差（供漂移断言与反证共用）。 */
+function driftOf(baselineRow, matrixRow) {
+  const drift = [];
+  for (const id of new Set([...Object.keys(baselineRow), ...Object.keys(matrixRow)])) {
+    const want = baselineRow[id];
+    const got = matrixRow[id];
+    if (want !== got) drift.push(`${FORM}/${id}: 基线=${want} → 现在=${got}`);
+  }
+  return drift;
+}
+
+/** 快照自洽性检查（供完整性断言与反证共用）：版本键、计数、未知 id、漏项。 */
+function integrityProblems(ids, baseline) {
+  const problems = [];
+  for (const form of Object.keys(baseline)) {
+    if (form !== FORM) problems.push(`快照版本键 ${form} ≠ kernel-pin ${FORM}`);
+    const row = baseline[form] || {};
+    if (Object.keys(row).length !== SPEC_COUNT) {
+      problems.push(`${form} 基线应覆盖 ${SPEC_COUNT} 项，实际 ${Object.keys(row).length}`);
+    }
+    for (const id of Object.keys(row)) if (!ids.has(id)) problems.push(`${form} 基线含未知 id ${id}`);
+    for (const id of ids) if (!(id in row)) problems.push(`${form} 基线缺 id ${id}`);
+  }
+  return problems;
 }
 
 // ===========================================================================
-// 基线快照（2026-08-28，rc.2 = .tmp-rc2-stage，rc.1 = .tmp-rc1-stage/rc1；
-// 0.1.2-alpha.1 升级后：12 项退役 + 6 项重定位/重锚点，44 项基线；
-// 新增 codex/claude 本地二进制回落 2 项 → 46 项基线；
-// 新增 skill-dirs-compat 1 项 → 47 项基线；
-// 恢复 session-manage（对话删除/归档管理）1 项 root 补丁 → 51 项基线；
-// alpha.2 重靶期退役 workspace-search-rail-fix（0.1.2-alpha.2 上游原生同款
-// 守卫，pristine :L1991 实证）→ 50 项基线；
-// alpha.2 黄区重靶（2026-08-31）：settings-section-guard 锚点改 alpha.2
-// installSection 形态（this.register），rc.2 老形态（sctx.settings.register）
-// 对新锚点失配 → rc.2 判定 changed → anchor-missing，其余 49 项判定不变；
-// 新增 workspace-chip-label-hold 1 项（chipTitle 的 workspaces.phase gate 放宽；
-// rc.2 stage 树含 alpha 世代 dsh-client-ui-conversation 且锚点一致 → changed，
-// rc.1 旧线无此包 → target-absent）→ 51 项基线）。
-// image-send-fix 重新登记（0.1.2-alpha.5 重锚 SessionCommandController.prompt，
-// 兼修识图转述失效 + prompt content undefined 裸崩两故障；rc.2 stage 树同
-// runtime-flash-fix 不含 dsh-api-session-controller → target-absent，rc.1 旧线亦然
-// → target-absent）→ 52 项基线）。
-// content-has-image-guard 新增（dsh-llm contentHasImage 非数组守卫，v0.6.0 reading
-// 'some' 崩溃根治）：与 adapter-prepare-call-guard 同靶 dsh-llm/lib/index.js → rc.2
-// 'changed'（stage 树含该包且 contentHasImage 锚点一致），rc.1 旧线无该包 → target-absent
-// → 53 项基线）。
-// history-page-size 新增（h1：历史分页容量 50→200）→ 靶 dsh-api-session-controller，
-// rc.2 stage 树不含该包 → 两形态 target-absent → 54 项基线。
-// journal-prepend-continuity 新增（h3：gateway/lib/client.js 不连续历史页断头删除）
-// → 靶 dsh-api-gateway，rc.2 / rc.1 均不含该包 → 两形态 target-absent → 55 项基线。
-// chat-scroll-autoload-older 新增（h2：dsh-client-ui-chat ChatView 滚到顶自动翻页）
-// → 靶 dsh-client-ui-chat，rc.2 / rc.1 均不含该包 → 两形态 target-absent → 56 项基线。
-// conversation-assembly-resilience 新增（BUG2 会话装配自愈）→ 靶 dsh-client-ui-conversation
-// lib/client.js，rc.2 含该包 accept 方法体匹配 → changed；rc.1 无该包 → target-absent → 57 项基线。
-// model-image-input 新增（模型卡「支持图片输入」勾选）→ kind:'root' 应用器不参与转换判定
-// （两形态恒 'root'）→ 58 项基线。
-// reasoning-row-collapse-width 新增（0.6.3 第一案：思考行折叠态空白）→ 靶 dsh-client-ui-chat，
-// rc.2 / rc.1 均不含该包 → 两形态 target-absent → 59 项基线。
-// session-unknown-event-tolerance 新增（0.6.3 第二案：未知 session 事件兜底）→ 靶
-// dsh-session-persistence，rc.2 / rc.1 均不含该包 → 两形态 target-absent → 60 项基线。
-// released-v0-history-recovery 新增（0.6.4：frozen released-v0 编解码器把准入清单外的
-// 载荷成员整条拒载 → 老会话读不回；只扩清单、成员原样保留、描述符盖章 v3 后仍走严格校验）
-// → 靶 dsh-session-format-v0-to-v1/lib/index.js。两形态按**真实 pristine 字节实跑**录入：
-// .tmp-kernel/.consumer-0.1.5-rc.1 与 .consumer-0.1.5-rc.2 的该文件 sha256 前缀相同
-// （15ae26b9…，104663B，未打补丁），三处锚点全命中 → 均 'changed'（产物含 marker）
-// → 61 项基线。
-// pi-ai-responses-tool-name-sanitize 新增（Responses 三条路由共用序列化的工具名清洗 +
-// 回映射，靶 @earendil-works/pi-ai/dist/api/openai-responses-shared.js）→ 该靶包不属
-// @deepseek-ai scope，本矩阵两形态的 joinUnder 口径都到不了它 → 均 target-absent
-// （与 pi-ai-4xx-dump / pi-ai-tool-schema-sanitize 同口径）→ 62 项基线。
-// pi-ai-tool-name-wire 新增（0.6.4 中央收口，order 336）：靶 @deepseek-ai/dsh-llm-pi-ai/
-// lib/index.js —— 内核把工具交给 pi-ai 前唯一出站收口 toolsOf() 与回程两处 case
-// "tool-call"，一处洗名一处还原，覆盖全部 provider（补上逐适配器两条之外的 Gemini /
-// Bedrock / Mistral 缺口）。此靶是 @deepseek-ai scope 且 pkgRel 自带完整作用域前缀，
-// 本矩阵 rc.2 joinUnder 把 pkgRel 再拼在 @deepseek-ai 下 → 双前缀命中不了，旧 stage 树
-// 在场时会以 target-absent 报漂移；故本行两形态值取自「对 .tmp-kernel/.consumer-
-// 0.1.5-rc.2 与 -rc.1 的该文件真跑 transformPiAiToolNameWire」——两代字节一致
-// （sha256 1f787eb5…，115270B，未打补丁），三锚点全命中 → 均 'changed'。若将来重建旧
-// stage 树并跑本矩阵，请以该树真实装配面复核，勿静默改值 → 63 项基线。
-// pi-ai-quota-not-retryable 新增（order 337，靶 @earendil-works/pi-ai/dist/utils/
-// provider-retry.js：isRetryableProviderError 把 429 一律当可重试，而 OpenAI 兼容渠道的
-// insufficient_quota 同为 429 却是终态 → 每次请求白等若干轮退避）。**两形态均为
-// target-absent**，依据是实测而非推断：本机可用的两代 pristine 闭包树
-// （.tmp-kernel/.consumer-0.1.5-rc.2 与 -rc.1 的 node_modules）里根本没有
-// @earendil-works/pi-ai 这个包（连包目录都不存在）—— pi-ai 是宿主可选依赖、不在
-// vendor/dsh-kernel 离线闭包内，install-pristine-kernel 不解包它。故按矩阵既有口径
-// （与同包 pi-ai-4xx-dump / pi-ai-tool-schema-sanitize / pi-ai-responses-tool-name-
-// sanitize 一致）记 target-absent：rc.2 的 joinUnder 会拼出
-// node_modules/@deepseek-ai/@earendil-works/pi-ai/...（双前缀，不存在），rc.1 的
-// joinUnder 只接受首段 'dsh' 的 pkgRel → 直接返回 null。另注：findPristineTarget
-// 的「桌面壳独有依赖」回退会落到 dsh-desktop/node_modules 的已打补丁副本，那是假绿
-// 来源，故本条在 ta6-transform-contract / ta6-heal-rollback-audit 按诚实 SKIP 处理
-// → 64 项基线。
-// 注意 rc.1 一行的口径：本矩阵 FORM_ROOTS 的 rc.1 形态是「dsh 主包解包树」，其 joinUnder
-// 只接受首段为 'dsh' 的 pkgRel（历史上该树未装配兄弟包 → 兄弟包靶一律 target-absent）；
-// 若将来重建出这株旧 stage 树，本行会以 target-absent 报漂移，届时按该树的真实装配面复核，
-// 不要静默改值。
-// 内核升级后 diff 此矩阵即知锚点漂移面：修改本常量 = 显式接受新基线。
+// 基线快照（2026-10-05 重录：0.2.0-rc.2 形态 = .tmp-kernel/.consumer-0.2.0-rc.2
+// 的 npm 闭包解包树，44 file + 15 root = 59 项，逐项由本文件 computeMatrix 真跑
+// 录入，不是手工填值。判定构成：39 changed / 15 root / 5 target-absent，
+// 零 anchor-missing、零 already、零 THROW —— 与 scripts/patch-deps.js 的
+// 「失配 0 / 失败 0」实况同源，两者互为对账。）
+//
+// 与旧代快照的差异（rc.2 真闭包 vs 旧 stage 树；逐条都是「旧值来自残缺树或双
+// 前缀口径」的纠正，不是锚点漂移）：
+//   · runtime-flash-fix / image-send-fix / credentials-absent-guidance /
+//     slot-legacy-key / slot-error-isolation / history-page-size /
+//     journal-prepend-continuity / chat-scroll-autoload-older /
+//     reasoning-row-collapse-width / session-unknown-event-tolerance /
+//     claude-local-bin-fallback → 现 'changed'：旧 stage 树缺对应包；
+//   · terminal-interrupt-escalation / profile-bundle-guard-appboot /
+//     agent-preset-fallback / pi-ai-tool-name-wire → 现 'changed'：旧值是重靶前
+//     的失配/双前缀口径残留；
+//   · atomic-write-orphan-lock / model-image-input / loader-tree-isolation /
+//     fallback-heal-isolation / settings-section-guard /
+//     profile-bundle-guard-profileboot → 已从注册表摘除，不再出现在本快照；
+//   · profile-patch-layer-guard → 新增行（取代 profile-boot 半边）。
 // ===========================================================================
 const BASELINE = {
-  'rc.2': {
-    'slot-legacy-key': 'target-absent',
+  '0.2.0-rc.2': {
+    'slot-legacy-key': 'changed',
     'slot-unkeyed-compat': 'changed',
-    'slot-error-isolation': 'target-absent',
-    'runtime-flash-fix': 'target-absent',
-    'image-send-fix': 'target-absent',
+    'slot-error-isolation': 'changed',
+    'runtime-flash-fix': 'changed',
     'shell-description-compat': 'changed',
+    'image-send-fix': 'changed',
     'attachment-mime-trust': 'changed',
     'persistent-shell-abort-race': 'changed',
-    'terminal-interrupt-escalation': 'anchor-missing',
+    'terminal-interrupt-escalation': 'changed',
     'profile-patch-guard': 'changed',
-    'profile-bundle-guard-appboot': 'anchor-missing',
-    'profile-bundle-guard-profileboot': 'already',
-    'settings-section-guard': 'anchor-missing',
-    'loader-tree-isolation': 'changed',
+    'profile-bundle-guard-appboot': 'changed',
+    'profile-patch-layer-guard': 'changed',
     'loader-activation-isolation': 'changed',
     'fail-loud-isolation': 'changed',
     'manual-sort-drag-fix': 'changed',
-    'fallback-heal-isolation': 'anchor-missing',
     'credentials-initial-retry': 'changed',
-    'credentials-absent-guidance': 'target-absent',
+    'credentials-absent-guidance': 'changed',
     'device-auth-guidance': 'changed',
     'kernel-web-boot-watchdog': 'changed',
     'plugin-inventory-tab-merge': 'changed',
     'web-search-baseurl': 'root',
     'menu-viewport': 'root',
-    'open-project-dir': 'root',
-    'workspace-pin': 'root',
-    'session-persistence': 'root',
     'session-manage': 'root',
+    'open-project-dir': 'root',
+    'session-persistence': 'root',
+    'workspace-pin': 'root',
     'tool-source-compat': 'root',
     'pi-ai-opencode-go-models': 'root',
     'pi-ai-credits': 'root',
     'pi-ai-overflow-message': 'root',
-    'atomic-write-orphan-lock': 'root',
+    'agent-preset-fallback': 'changed',
     'settings-models-resilience': 'root',
     'pi-ai-reasoning-defaults': 'root',
     'bundle-arrival-retry': 'root',
     'agent-loop-scheduler-guard': 'root',
     'empty-tool-name-guidance': 'root',
-    'model-image-input': 'root',
-    'agent-preset-fallback': 'anchor-missing',
     'prompt-context-literal': 'changed',
     'wsl-picker-browse': 'changed',
     'adapter-prepare-call-guard': 'changed',
     'content-has-image-guard': 'changed',
     'session-header-scan-guard': 'changed',
     'session-load-graceful': 'changed',
+    // codex / pi-ai 系靶不属 @deepseek-ai scope，也不在 vendor/dsh-kernel 离线闭包
+    // 内（pi-ai 是宿主可选依赖，install-pristine-kernel 不解包它）→ 恒
+    // target-absent。真实字节判定见各自单测：unit-patch-tool-source-compat
+    // （codex/claude 回落）、unit-pi-ai-*（4xx dump / tool-schema sanitize /
+    // responses tool-name / quota-not-retryable）。claude-local-bin-fallback 的靶
+    // 是 @deepseek-ai 包，故同组里只有 codex 一条落 target-absent。
     'codex-local-bin-fallback': 'target-absent',
-    'claude-local-bin-fallback': 'target-absent',
+    'claude-local-bin-fallback': 'changed',
     'skill-dirs-compat': 'changed',
     'pi-ai-4xx-dump': 'target-absent',
     'pi-ai-tool-schema-sanitize': 'target-absent',
-    // pi-ai-responses-tool-name-sanitize：靶 @earendil-works/pi-ai/dist/api/
-    // openai-responses-shared.js；本矩阵 rc.2 口径把 pkgRel 拼在 @deepseek-ai 下，
-    // 非 @deepseek-ai scope 的 pi-ai 靶恒 target-absent（与同包两条补丁同口径；
-    // 真实字节判定见 scripts/test/unit-pi-ai-responses-tool-name.test.js）。
     'pi-ai-responses-tool-name-sanitize': 'target-absent',
-    // cardian 双前缀修复后，ds-tool-schema-sanitize 的 pkgRel 收口到单前缀，
-    // rc.2 pristine 树的 @deepseek-ai/dsh-llm-deepseek/lib/index.js 现可命中→
-    // 补丁真正应用（旧基线 target-absent 是双前缀 bug 导致的 0 命中假象）。
+    'pi-ai-tool-name-wire': 'changed',
+    'pi-ai-quota-not-retryable': 'target-absent',
     'ds-tool-schema-sanitize': 'changed',
     'workspace-chip-label-hold': 'changed',
-    // history-page-size（h1）：靶 dsh-api-session-controller，rc.2 stage 树不含该包
-    // （同 runtime-flash-fix / image-send-fix）→ target-absent。
-    'history-page-size': 'target-absent',
-    // journal-prepend-continuity（h3）：靶 dsh-api-gateway，rc.2 stage 树不含该包 → target-absent。
-    'journal-prepend-continuity': 'target-absent',
-    // chat-scroll-autoload-older（h2）：靶 dsh-client-ui-chat，rc.2 stage 树不含该包 → target-absent。
-    'chat-scroll-autoload-older': 'target-absent',
-    // conversation-assembly-resilience（BUG2）：靶 dsh-client-ui-conversation/lib/client.js，
-    // rc.2 stage 树含该包且 accept(window) 方法体匹配 → changed。
+    'history-page-size': 'changed',
+    'journal-prepend-continuity': 'changed',
+    'chat-scroll-autoload-older': 'changed',
     'conversation-assembly-resilience': 'changed',
-    // reasoning-row-collapse-width（0.6.3 第一案）：靶 dsh-client-ui-chat，rc.2 stage 树
-    // 不含该包 → target-absent。
-    'reasoning-row-collapse-width': 'target-absent',
-    // session-unknown-event-tolerance（0.6.3 第二案）：rc.2 / rc.1 均不含
-    // dsh-session-persistence → 两形态 target-absent。
-    'session-unknown-event-tolerance': 'target-absent',
-    // released-v0-history-recovery（0.6.4）：靶 dsh-session-format-v0-to-v1/lib/index.js，
-    // rc.2 pristine 闭包树（.tmp-kernel/.consumer-0.1.5-rc.2 未打补丁字节）实跑 → changed。
+    'reasoning-row-collapse-width': 'changed',
+    'session-unknown-event-tolerance': 'changed',
     'released-v0-history-recovery': 'changed',
-    // pi-ai-tool-name-wire（0.6.4 中央收口，order 336）：靶 @deepseek-ai/dsh-llm-pi-ai/
-    // lib/index.js，toolsOf() 出站 + 回程两处 tool-call 三锚点直取真跑；与 rc.1 同源
-    // 字节（sha256 1f787eb5…，115270B）→ 'changed'（详见 BASELINE 头部对账注释）。
-    'pi-ai-tool-name-wire': 'changed',
-    // pi-ai-quota-not-retryable（order 337）：靶 @earendil-works/pi-ai/dist/utils/
-    // provider-retry.js，非 @deepseek-ai scope 且两代 pristine 闭包树连该包目录都
-    // 不存在（实测）→ 按矩阵既有口径 target-absent（与同包另三条 pi-ai 补丁一致；
-    // 真实字节三态与功能面判定见 scripts/test/unit-pi-ai-quota-not-retryable.test.js）。
-    'pi-ai-quota-not-retryable': 'target-absent',
-  },
-  'rc.1': {
-    'slot-legacy-key': 'target-absent',
-    'slot-unkeyed-compat': 'target-absent',
-    'slot-error-isolation': 'target-absent',
-    'runtime-flash-fix': 'target-absent',
-    'image-send-fix': 'target-absent',
-    'shell-description-compat': 'target-absent',
-    'attachment-mime-trust': 'target-absent',
-    'persistent-shell-abort-race': 'target-absent',
-    'terminal-interrupt-escalation': 'target-absent',
-    'profile-patch-guard': 'target-absent',
-    'profile-bundle-guard-appboot': 'target-absent',
-    'profile-bundle-guard-profileboot': 'already',
-    'settings-section-guard': 'target-absent',
-    'loader-tree-isolation': 'target-absent',
-    'loader-activation-isolation': 'target-absent',
-    'fail-loud-isolation': 'target-absent',
-    'manual-sort-drag-fix': 'target-absent',
-    'fallback-heal-isolation': 'target-absent',
-    'credentials-initial-retry': 'target-absent',
-    'credentials-absent-guidance': 'target-absent',
-    'device-auth-guidance': 'target-absent',
-    'kernel-web-boot-watchdog': 'target-absent',
-    'plugin-inventory-tab-merge': 'target-absent',
-    'web-search-baseurl': 'root',
-    'menu-viewport': 'root',
-    'open-project-dir': 'root',
-    'workspace-pin': 'root',
-    'session-persistence': 'root',
-    'session-manage': 'root',
-    'tool-source-compat': 'root',
-    'pi-ai-opencode-go-models': 'root',
-    'pi-ai-credits': 'root',
-    'pi-ai-overflow-message': 'root',
-    'atomic-write-orphan-lock': 'root',
-    'settings-models-resilience': 'root',
-    'pi-ai-reasoning-defaults': 'root',
-    'bundle-arrival-retry': 'root',
-    'agent-loop-scheduler-guard': 'root',
-    'empty-tool-name-guidance': 'root',
-    'model-image-input': 'root',
-    'agent-preset-fallback': 'target-absent',
-    'prompt-context-literal': 'target-absent',
-    'wsl-picker-browse': 'target-absent',
-    'adapter-prepare-call-guard': 'target-absent',
-    'content-has-image-guard': 'target-absent',
-    'session-header-scan-guard': 'target-absent',
-    'session-load-graceful': 'target-absent',
-    'codex-local-bin-fallback': 'target-absent',
-    'claude-local-bin-fallback': 'target-absent',
-    'skill-dirs-compat': 'target-absent',
-    'pi-ai-4xx-dump': 'target-absent',
-    'pi-ai-tool-schema-sanitize': 'target-absent',
-    // rc.1 一行的 joinUnder 只接受首段 'dsh' 的 pkgRel → pi-ai 靶恒 target-absent。
-    'pi-ai-responses-tool-name-sanitize': 'target-absent',
-    'ds-tool-schema-sanitize': 'target-absent',
-    'workspace-chip-label-hold': 'target-absent',
-    'history-page-size': 'target-absent',
-    'journal-prepend-continuity': 'target-absent',
-    'chat-scroll-autoload-older': 'target-absent',
-    // conversation-assembly-resilience（BUG2）：rc.1 旧线仅 dsh 主包，无 ui-conversation → target-absent。
-    'conversation-assembly-resilience': 'target-absent',
-// reasoning-row-collapse-width（0.6.3 第一案）：同 chat-scroll-autoload-older，
-    // rc.2 / rc.1 均不含 dsh-client-ui-chat → 两形态 target-absent。
-    'reasoning-row-collapse-width': 'target-absent',
-    // workspace-pin（0.6.3）：工作区置顶 root 应用器（靶 dsh-client-ui-workspace
-    // /lib/client.js，锚点基于 open-project-dir 应用后文本）→ 两形态 'root'。
-    'workspace-pin': 'root',
-    // session-unknown-event-tolerance（0.6.3 第二案）：rc.2 / rc.1 均不含
-    // dsh-session-persistence → 两形态 target-absent。
-    'session-unknown-event-tolerance': 'target-absent',
-    // released-v0-history-recovery（0.6.4）：靶包在 rc.1 闭包树同样存在且与 rc.2
-    // 字节一致（sha256 15ae26b9…），pristine 实跑 → changed；旧 stage 树（仅 dsh
-    // 主包解包）口径见上方对账注释。
-    'released-v0-history-recovery': 'changed',
-    // pi-ai-tool-name-wire（0.6.4 中央收口，order 336）：靶 @deepseek-ai/dsh-llm-pi-ai/
-    // lib/index.js，rc.1 闭包树（.tmp-kernel/.consumer-0.1.5-rc.1 未打补丁字节）与
-    // rc.2 完全一致（sha256 1f787eb5…，115270B），三锚点全命中 → 'changed'。
-    'pi-ai-tool-name-wire': 'changed',
-    // pi-ai-quota-not-retryable（order 337）：靶 @earendil-works/pi-ai/dist/utils/
-    // provider-retry.js；本形态 joinUnder 只接受首段 'dsh' 的 pkgRel，且 rc.1 pristine
-    // 闭包树无 @earendil-works/pi-ai 包目录（实测）→ target-absent。
-    'pi-ai-quota-not-retryable': 'target-absent',
   },
 };
 
-test('64 补丁 × rc.2 / rc.1 双形态判定矩阵与基线快照一致（锚点漂移哨兵）', { skip: !formRoot('rc.2') ? 'pristine rc.2 stage 树不可用（.tmp-rc2-stage 缺失）' : false }, () => {
-  const matrix = computeMatrix();
-  // 打印当前矩阵（基线对照 / 升级 diff 材料）。
-  console.log('[TA6 基线矩阵]');
-  const ids = PATCH_SPECS.map((s) => s.id);
-  console.log('  id'.padEnd(34) + 'rc.2'.padEnd(18) + 'rc.1');
-  for (const id of ids) {
-    console.log('  ' + id.padEnd(32) + String(matrix['rc.2'][id]).padEnd(18) + String(matrix['rc.1'][id]));
+test(`${SPEC_COUNT} 补丁 × pristine ${FORM} 判定矩阵与基线快照一致（锚点漂移哨兵）`, () => {
+  const root = formRoot();
+  assert.ok(root,
+    '缺与 kernel-pin(' + FORM + ') 同版的 pristine 内核闭包树。已解析到：'
+    + (pristineRoots().join(' , ') || '（无）') + '。先跑 node scripts/install-pristine-kernel.mjs。');
+  const matrix = computeMatrix(root);
+  // 打印当前矩阵（升级时的 diff 材料）。
+  console.log('[TA6 基线矩阵] root = ' + root);
+  for (const spec of PATCH_SPECS.slice().sort((a, b) => a.order - b.order)) {
+    console.log('  ' + spec.id.padEnd(34) + String(matrix[spec.id]));
   }
-
-  const drift = [];
-  for (const form of Object.keys(BASELINE)) {
-    const ids2 = new Set([...Object.keys(BASELINE[form]), ...Object.keys(matrix[form] || {})]);
-    for (const id of ids2) {
-      const want = BASELINE[form][id];
-      const got = (matrix[form] || {})[id];
-      if (want !== got) drift.push(`${form}/${id}: 基线=${want} → 现在=${got}`);
-    }
-  }
-  assert.deepEqual(drift, [],
-    `判定矩阵漂移（内核形态变化或锚点漂移；确认后更新 BASELINE 快照以显式接受新基线）：\n  ${drift.join('\n  ')}`);
+  const drift = driftOf(BASELINE[FORM], matrix);
+  assert.equal(drift.length, 0,
+    '判定矩阵漂移（内核形态变化或锚点漂移；确认后更新 BASELINE 快照以显式接受新基线）:\n  '
+    + drift.join('\n  '));
 });
 
-test('基线快照自身完整性：两形态 × 64 id 全覆盖', () => {
+test('基线快照自身完整性：单形态 × ' + SPEC_COUNT + ' id 全覆盖且版本键等于 pin', () => {
   const ids = new Set(PATCH_SPECS.map((s) => s.id));
-  assert.equal(ids.size, 64);
-  for (const form of Object.keys(BASELINE)) {
-    assert.equal(Object.keys(BASELINE[form]).length, 64, `${form} 基线应覆盖 64 项`);
-    for (const id of Object.keys(BASELINE[form])) assert.ok(ids.has(id), `${form} 基线含未知 id ${id}`);
-  }
+  assert.equal(ids.size, SPEC_COUNT, '注册表规格总数（计数锁，沿革见文件头 SPEC_COUNT）');
+  const problems = integrityProblems(ids, BASELINE);
+  assert.equal(problems.length, 0, '快照必须自洽:\n  ' + problems.join('\n  '));
 });
 
-test('rc.1 形态根不可用时跳过而非误报（前置宽容）', { skip: formRoot('rc.1') ? false : 'rc.1 stage 树不可用（.tmp-rc1-stage/rc1/package 缺失）' }, () => {
-  const matrix = computeMatrix();
-  assert.notEqual(matrix['rc.1']['code-mode-compat'], 'form-unavailable');
+test('完整性与漂移判据可被拆掉（反证，防空判据）', () => {
+  const ids = new Set(PATCH_SPECS.map((s) => s.id));
+  const snapshot = BASELINE[FORM];
+
+  // 反证一：少一项 → 完整性必须同时报「缺 id」与计数偏离。
+  const shrunk = { ...snapshot };
+  const missingId = Object.keys(shrunk)[0];
+  delete shrunk[missingId];
+  const p1 = integrityProblems(ids, { [FORM]: shrunk });
+  assert.ok(p1.some((m) => m.includes('缺 id ' + missingId)), '漏登记一个 id 必须被完整性判据抓到');
+  assert.ok(p1.some((m) => m.includes(String(SPEC_COUNT))), '计数偏离必须同时被计数锁抓到');
+
+  // 反证二：多一个幽灵 id → 必须报「未知 id」与计数偏离。
+  const p2 = integrityProblems(ids, { [FORM]: { ...snapshot, 'ghost-spec-id': 'changed' } });
+  assert.ok(p2.some((m) => m.includes('未知 id ghost-spec-id')), '幽灵 id 必须被完整性判据抓到');
+
+  // 反证三：版本键换成旧代 → 必须响亮报「≠ kernel-pin」，不许静默沿用旧基线。
+  const p3 = integrityProblems(ids, { '0.1.6-alpha.1': snapshot });
+  assert.ok(p3.some((m) => m.includes('kernel-pin')), '版本键与 pin 不符必须报错');
+
+  // 反证四：driftOf 不是恒空判据——基线与现算差一项就必须点名。
+  const drifted = { ...snapshot, 'slot-legacy-key': 'anchor-missing' };
+  const nowRow = { ...snapshot, 'slot-legacy-key': 'changed' };
+  const d = driftOf(drifted, nowRow);
+  assert.equal(d.length, 1, '一条偏离就该报一条，不多报');
+  assert.ok(d[0].includes('slot-legacy-key: 基线=anchor-missing → 现在=changed'),
+    '锚点漂移必须逐项报出：' + d.join(' / '));
 });

@@ -111,9 +111,12 @@ function collectPluginCandidates(profileDir, coreDirDshAt, assetsDir, fs = requi
  * @param {string} dir 包目录
  * @param {object} yaml js-yaml 方言加载器（null = 不可用）
  * @param {object} fs
- * @param {boolean} [listed] 是否在 dsh.profile.bundles 启动清单内（清单内缺
- *   dsh.bundle.patch 声明会在下次启动 fail-loud —— Error: profile bundle "X"
- *   declares no dsh.bundle —— 必须升级为 error，并给出移除指引）
+ * @param {boolean} [listed] 是否在 dsh.profile.bundles 启动清单内（0.2.0-rc.2 起
+ *   内核 loadProfileDirectory 逐 bundle try/catch：清单内缺 dsh.bundle 或缺
+ *   dsh.bundle.patch 都不再击穿启动，而是把该 bundle 整体跳过并往 stderr 打一行
+ *   `dsh: skipping profile bundle "X": <原因>`。后果从「整个应用起不来」变成
+ *   「这个插件静默不加载」——仍是必须修的装配契约缺陷（我们发出去的插件哑掉），
+ *   所以保持 error 等级，但正文按真实行为写，不再声称 fail-loud）
  * @returns {{name:string, issues:Array<{level:string, text:string}>, ids:string[], patchOk:boolean}}
  */
 function checkPluginPackage(name, dir, yaml, fs = require('node:fs'), listed = false) {
@@ -131,11 +134,11 @@ function checkPluginPackage(name, dir, yaml, fs = require('node:fs'), listed = f
   const dsh = pkg && pkg.dsh;
   if (!dsh || (typeof dsh !== 'object')) {
     issues.push(listed
-      ? { level: 'error', text: '在启动清单（dsh.profile.bundles）中但未声明 dsh 插件清单（dsh.bundle / dsh.client）——下次启动会 fail-loud（declares no dsh.bundle），请从清单移除或补声明' }
+      ? { level: 'error', text: '在启动清单（dsh.profile.bundles）中但未声明 dsh 插件清单（dsh.bundle / dsh.client）——rc.2 起下次启动不再 fail-loud，而是跳过该 bundle 并在 stderr 打 skipping profile bundle "X": … declares no dsh.bundle，插件静默不加载（不牵连其余 bundle），请从清单移除或补声明' }
       : { level: 'warning', text: '未声明 dsh 插件清单（dsh.bundle / dsh.client），可能不是可加载插件' });
   } else {
     if (listed && !(dsh.bundle && typeof dsh.bundle === 'object' && typeof dsh.bundle.patch === 'string')) {
-      issues.push({ level: 'error', text: '在启动清单（dsh.profile.bundles）中但未声明 dsh.bundle.patch——下次启动会 fail-loud（declares no dsh.bundle），请从清单移除或补声明' });
+      issues.push({ level: 'error', text: '在启动清单（dsh.profile.bundles）中但未声明 dsh.bundle.patch——rc.2 起下次启动不再 fail-loud，而是跳过该 bundle 并在 stderr 打 skipping profile bundle "X": <原因>（缺 dsh.bundle 报 declares no dsh.bundle；patch 非路径/路径数组报 dsh.bundle.patch must be a file path or a list of file paths），插件静默不加载，请从清单移除或补声明' });
     }
     if (dsh.bundle && typeof dsh.bundle === 'object') {
       if (typeof dsh.bundle.patch === 'string') {

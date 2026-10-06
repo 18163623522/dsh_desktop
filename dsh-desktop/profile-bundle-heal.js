@@ -1,17 +1,18 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// profile bundle 装配链防护（main.js applyProfileBundleGuard 与
-// scripts/sync-companion-plugins.js 共用）：把 dsh 对 profile bundle 的
-// fail-loud 启动语义收口为「诊断 + 跳过该层 + 继续启动」。覆盖的崩溃形态
-// （均在最新 vendored dsh 0.1.0-rc.6 上实机复现）：
-//   1. cannot resolve profile bundle —— manifest 登记了未安装 / 被清理的包；
-//   2. declares no dsh.bundle —— 普通库或仅客户端 bundle（dsh.bundle 无
-//      patch 层）被登记为 profile 层；
-//   3. bundle 的 cordis.patch.yml 缺失 / 无法解析；
-//   4. profiles/<name>/package.json 读不出 / JSON 损坏 / 顶层非对象；
-//   5. $DSH_HOME/cordis.patch.yml（家级用户补丁层）损坏 —— 同时覆盖启动
-//      与 HMR 热重载路径。
+// profile 装配链防护（main.js applyProfileBundleGuard 与
+// scripts/sync-companion-plugins.js 共用）：把 dsh 对 profile 数据的
+// fail-loud 启动语义收口为「诊断 + 降级该层 + 继续启动」。靶面随内核换代
+// 收口到 @deepseek-ai/dsh-app-boot/lib/index.js（0.2.0-rc.2 起补丁层装配集中
+// 到 readProfilePatches，profile-boot-*.js 形态消失）。覆盖的崩溃形态：
+//   1. profiles/<name>/package.json 读不出 / JSON 损坏 / 顶层非对象；
+//   2. manifest 的 dsh.profile.bundles 不是数组；
+//   3. profile 自己的 cordis.patch.yml 与家级 $DSH_HOME/cordis.patch.yml 损坏
+//      —— 同时覆盖启动与 dsh-hmr 热重载路径。
+//   （bundle 层本身缺包 / 无 dsh.bundle / cordis.patch.yml 解析失败这一类，
+//    rc.2 已在内核里原生 try/catch + skippedBundles，见 applyAppBootBundleGuard
+//    上方注释，故本模块不再重复防护。）
 //
 // 本模块不持有任何 dsh 安装路径，只提供纯函数：幂等的源码字符串变换（锚点
 // 不匹配时原样返回）、bundle 目录只读校验与原子写；具体文件定位与写入时机由
@@ -22,10 +23,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-/** dsh-app-boot 注入代码的幂等标记。 */
+/** dsh-app-boot bundle 防护注入代码的幂等标记。 */
 const PROFILE_BUNDLE_GUARD_MARKER = 'dsh-desktop guard: a broken profile bundle must not brick';
-/** dsh profile-boot 注入代码的幂等标记。 */
-const PROFILE_BOOT_GUARD_MARKER = 'function loadUserPatchLayerSafe';
 
 // ---------------------------------------------------------------------------
 // bundle 包描述解析（纯函数）
@@ -286,36 +285,27 @@ const { writeFileAtomic } = require('./scripts/lib/patch-io');
 // @deepseek-ai/dsh-app-boot/lib/index.js 变换
 // ---------------------------------------------------------------------------
 
-// loadProfile 中逐个 bundle 严格装配的原始代码块（built 文件为制表符缩进）。
-// 0.1.2-alpha.1：`normalizeShippedProfile(...)` 结果先落入 `manifest` 常量，
-// `bundles` 单独声明后再 `.map(...)`（且 patchReload 校验插入其间），锚点按新形态改写。
-const APP_BOOT_LAYERS_ANCHOR = [
-  '\tconst layers = bundles.map((packageName) => {',
-  '\t\tconst packageDir = resolveBundleDir(binName, packageName, installAnchor, dir);',
-  '\t\tconst declared = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")).dsh?.bundle?.patch;',
-  '\t\tif (declared === void 0) throw new Error(`${binName}: profile bundle ${JSON.stringify(packageName)} declares no dsh.bundle in its package.json`);',
-  '\t\tconst patchPath = join(packageDir, declared);',
-  '\t\treturn {',
-  '\t\t\tpackageName,',
-  '\t\t\tpackageDir,',
-  '\t\t\tpatchPath,',
-  '\t\t\tpatches: loadOverlayPatches(binName, patchPath)',
-  '\t\t};',
-  '\t});',
-].join('\n');
+// profile 自身 manifest 的两个严格读取点（built 文件为制表符缩进）。
+// 0.2.0-rc.2 换代判定：逐 bundle 装配的容错已由上游原生实装——
+// loadProfileDirectory 改成 `for (const packageName of bundles) try { … } catch {
+// skippedBundles.push(...) }`，并以 reportSkippedBundles 打到 stderr。所以本守卫
+// 原本替换的整段 layers.map() 已不存在，收缩为只护上游仍留在 try 之外的两处：
+//   ① profile 自己的 package.json 损坏（loadProfile 的 normalizeShippedProfile 与
+//      loadProfileDirectory 的 bundles 读取都在 try 头之前，抛错即启动失败页）；
+//   ② `dsh.profile.bundles` 被写成非数组（for…of 在 try 头，同样击穿启动）。
+const APP_BOOT_PROFILE_MANIFEST_ANCHOR = '\tnormalizeShippedProfile(name, dir, readProfileManifest(binName, dir));';
+const APP_BOOT_BUNDLES_ANCHOR = '\tconst bundles = readProfileManifest(binName, dir).dsh?.profile?.bundles ?? [];';
 
 // 注入位置：composeEntries 函数声明前（模块作用域内所有被用符号均可见）。
 const APP_BOOT_INSERT_ANCHOR = 'function composeEntries(layers, warn = () => {}) {';
 
 const APP_BOOT_GUARD_CODE = [
-  '/** dsh-desktop guard: a broken profile bundle must not brick the surface. Every',
-  ' * `dsh.profile.bundles` entry is loaded through this helper: an unresolvable',
-  ' * package, an unreadable or unparsable bundle manifest, a missing',
-  ' * `dsh.bundle.patch` declaration, or a bundle patch layer that fails to load',
-  ' * no longer aborts the boot — the layer is skipped with a labelled stderr',
-  ' * diagnostic and the profile boots without it. A corrupt profile manifest is',
-  ' * backed up and re-initialized from the shipped template (its previous content',
-  ' * stays in the `.broken-` backup). */',
+  '/** dsh-desktop guard: a broken profile bundle must not brick the surface.',
+  ' * 0.2.0-rc.2 起逐 bundle 的容错由上游原生实装（loadProfileDirectory 内',
+  ' * `for (const packageName of bundles) try {…} catch { skippedBundles.push(…) }` +',
+  ' * reportSkippedBundles），本守卫只补它仍留在 try 之外的两处：profile 自己的',
+  ' * package.json 损坏（备份后按出厂模板重建，原件留在 `.broken-` 备份里），',
+  ' * 以及 `dsh.profile.bundles` 被写成非数组（for…of 会直接击穿启动）。 */',
   'function loadProfileManifestSafe(binName, name, dir) {',
   '\ttry {',
   '\t\treturn readProfileManifest(binName, dir);',
@@ -341,115 +331,65 @@ const APP_BOOT_GUARD_CODE = [
   '\t\treturn readProfileManifest(binName, dir);',
   '\t}',
   '}',
-  'function loadBundleLayerSafe(binName, packageName, installAnchor, profileDir) {',
-  '\tconst skip = (reason) => {',
-  '\t\tprocess.stderr.write(`' + '${binName}: profile bundle ${JSON.stringify(packageName)} skipped — ${reason}\\n`' + ');',
-  '\t\treturn { packageName, packageDir: null, patchPath: null, patches: [] };',
-  '\t};',
-  '\tlet packageDir;',
-  '\ttry {',
-  '\t\tpackageDir = resolveBundleDir(binName, packageName, installAnchor, profileDir);',
-  '\t} catch (error) {',
-  '\t\treturn skip(`' + 'cannot resolve it from the dsh installation or ${profileDir} (${String(error?.message ?? error)}); run \'dsh plugin --profile ${basename(profileDir)} install\' if its dependency is not installed`' + ');',
-  '\t}',
-  '\tlet manifest;',
-  '\ttry {',
-  '\t\tmanifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));',
-  '\t} catch (error) {',
-  '\t\treturn skip(`' + 'its package.json cannot be read or parsed (${String(error?.message ?? error)}); reinstall it with \'dsh plugin --profile ${basename(profileDir)} install\'`' + ');',
-  '\t}',
-  '\tconst declared = manifest?.dsh?.bundle?.patch;',
-  '\tif (typeof declared !== "string" || declared === "") {',
-  '\t\tconst hint = manifest?.dsh?.bundle !== void 0',
-  '\t\t\t? "it declares dsh.bundle without a patch layer (a client-only bundle has no Node layer to mount)"',
-  '\t\t\t: "it declares no dsh.bundle in its package.json (not a dsh plugin bundle)";',
-  '\t\treturn skip(`' + '${hint}; it stays out of the profile layer stack`' + ');',
-  '\t}',
-  '\tconst patchPath = join(packageDir, declared);',
-  '\ttry {',
-  '\t\treturn { packageName, packageDir, patchPath, patches: loadOverlayPatches(binName, patchPath) };',
-  '\t} catch (error) {',
-  '\t\treturn skip(`' + 'its patch layer ${patchPath} failed to load (${String(error?.message ?? error)}); the bundle stays disabled until its files are restored`' + ');',
-  '\t}',
-  '}',
-  'function loadProfileLayers(binName, name, dir, installAnchor) {',
-  '\tconst manifest = loadProfileManifestSafe(binName, name, dir);',
-  '\tconst normalized = normalizeShippedProfile(name, dir, manifest);',
-  '\tconst bundles = normalized.dsh?.profile?.bundles;',
-  '\tif (bundles !== void 0 && !Array.isArray(bundles)) {',
-  '\t\tprocess.stderr.write(`' + '${binName}: profile ${JSON.stringify(name)}: dsh.profile.bundles must be an array (got ${typeof bundles}); booting without bundle layers — fix the profile manifest or run \'dsh plugin --profile ${name} install\'\\n`' + ');',
-  '\t\treturn [];',
-  '\t}',
-  '\treturn (bundles ?? []).map((packageName) => loadBundleLayerSafe(binName, packageName, installAnchor, dir));',
+  'function loadProfileBundlesSafe(binName, name, dir) {',
+  '\tconst bundles = loadProfileManifestSafe(binName, name, dir).dsh?.profile?.bundles ?? [];',
+  '\tif (Array.isArray(bundles)) return bundles;',
+  '\tprocess.stderr.write(`' + '${binName}: profile ${JSON.stringify(name)}: dsh.profile.bundles must be an array (got ${typeof bundles}); booting without bundle layers — fix the profile manifest or run \'dsh plugin --profile ${name} install\'\\n`' + ');',
+  '\treturn [];',
   '}',
 ].join('\n');
 
 /**
- * 改写 dsh-app-boot/lib/index.js：把 loadProfile 的严格 bundle 装配替换为
- * 自愈装配（bundle 层跳过 + manifest 备份重建）。已注入或锚点失配时原样返回。
+ * 改写 dsh-app-boot/lib/index.js：profile 自身 manifest 的两处严格读取换成自愈读取
+ * （损坏备份 + 按出厂模板重建 + 继续），bundles 非数组时降级为空层。
+ * 已注入或任一锚点失配时原样返回。
  * @returns {{ changed: boolean, src: string }}
  */
 function applyAppBootBundleGuard(src) {
   if (typeof src !== 'string') return { changed: false, src };
   if (src.includes(PROFILE_BUNDLE_GUARD_MARKER)) return { changed: false, src };
-  if (!src.includes(APP_BOOT_LAYERS_ANCHOR) || !src.includes(APP_BOOT_INSERT_ANCHOR)) return { changed: false, src };
-  // rc.1 起该块落在 loadProfileDirectory(binName, dir, installAnchor, options) 内，
-  // 其签名无 name 形参（上游自己以 basename(dir) 派生 profile 名）——传 name 会 ReferenceError。
-  let out = src.replace(APP_BOOT_LAYERS_ANCHOR, '\tconst layers = loadProfileLayers(binName, basename(dir), dir, installAnchor);');
+  if (
+    !src.includes(APP_BOOT_PROFILE_MANIFEST_ANCHOR)
+    || !src.includes(APP_BOOT_BUNDLES_ANCHOR)
+    || !src.includes(APP_BOOT_INSERT_ANCHOR)
+  ) return { changed: false, src };
+  let out = src
+    .replace(APP_BOOT_PROFILE_MANIFEST_ANCHOR, '\tnormalizeShippedProfile(name, dir, loadProfileManifestSafe(binName, name, dir));')
+    .replace(APP_BOOT_BUNDLES_ANCHOR, '\tconst bundles = loadProfileBundlesSafe(binName, basename(dir), dir);');
   out = out.replace(APP_BOOT_INSERT_ANCHOR, APP_BOOT_GUARD_CODE + '\n\n' + APP_BOOT_INSERT_ANCHOR);
   return { changed: true, src: out };
 }
 
 // ---------------------------------------------------------------------------
-// @deepseek-ai/dsh/lib/profile-boot-*.js 变换（家级补丁层自愈）
+// dsh-app-boot/lib/index.js 变换（用户补丁层自愈）
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// dsh/lib/profile-boot-*.js 变换（heal 调用防护）
-// ---------------------------------------------------------------------------
+// 0.2.0-rc.2 把补丁层装配收口进 app-boot 的 readProfilePatches：profile 自己的
+// cordis.patch.yml 与家级 $DSH_HOME/cordis.patch.yml 都由 loadOptionalPatches 直读，
+// 而它对「读得出但 YAML 解析失败 / 顶层不是数组 / 元素不是映射」一律 throw
+// （只有 ENOENT 返回 undefined）。这两个文件是**用户数据**：用户手改缩进打错一次，
+// 过去就是 dsh web exit 1 进启动失败页，而一次致命启动又会让 sanitizeProfile 把
+// profile 的补丁层改名抹掉（我们的包一起没了）。这里换成自愈读取——损坏文件备份为
+// <file>.broken-<ts>、重写为注释 + 空列表、告警后继续启动。
+// readProfilePatches 同时是 dsh-hmr 的进口（dsh-hmr/lib/index.js:8 import、:369 调用），
+// 所以一处收口覆盖「启动 + 热重载」两条路；0.1.6 及更早的 profile-boot-*.js
+// （homePatchPath / composeLive 形态）随内核换代删除，本节即其继任者。
+// 幂等标记 = function safeLoadUserPatchLayer。名字必须与 patch-adapters 里的
+// loadUserPatchLayer（补丁层另一处防护）互不为子串，否则两条补丁会互相吞掉。
+const APP_BOOT_PATCH_LAYER_GUARD_MARKER = 'function safeLoadUserPatchLayer';
+// 两处严格读取（实测 0.2.0-rc.2 各 hits=1，0.1.6 各 hits=0——该函数是 rc.2 新增）。
+const APP_BOOT_PATCH_LAYER_USER_ANCHOR = '\t\t...initialProfile?.patches ?? loadOptionalPatches(binName, context.patchPath) ?? [],';
+const APP_BOOT_PATCH_LAYER_HOME_ANCHOR = '\t\t...loadOptionalPatches(binName, join(context.home, "cordis.patch.yml")) ?? [],';
+// 注入点：readProfilePatches 定义行之前（hits=1）。与 bundle 防护的 composeEntries
+// 注入点分处不同区段，两条补丁任意顺序叠加都不互相破坏。
+const APP_BOOT_PATCH_LAYER_INSERT_ANCHOR = 'function readProfilePatches(binName, context, initialProfile) {';
 
-// prepareProfile 每次 boot 无条件调用官方 healProfilesModuleFallback(INSTALL_ANCHOR)：
-// 它 BFS 依赖闭包并 readFileSync 每个 package.json，客户机器上（便携版解压不完整、
-// 杀软锁定、云同步抽风）可能 ENOENT，未捕获即 dsh web exit 1（启动失败页）。
-// main.js 的 repairProfileFallback 只保护壳自己的那次调用，挡不住引擎 boot 内部
-// 的这次。这里把调用包 try/catch：heal 失败只告警，绝不 brick 启动。
-// 幂等标记 = dsh-desktop guard: healProfilesModuleFallback failed。
-const PROFILE_BOOT_HEAL_MARKER = 'dsh-desktop guard: healProfilesModuleFallback failed';
-// 0.1.5-rc.1 重锚：调用改为 await healProfilesModuleFallback({ installAnchor, profile }) 四行形态。
-const PROFILE_BOOT_HEAL_ANCHOR = '\tawait healProfilesModuleFallback({\n\t\tinstallAnchor: INSTALL_ANCHOR,\n\t\tprofile\n\t});';
-const PROFILE_BOOT_HEAL_GUARDED = [
-  'try {',
-  '\tawait healProfilesModuleFallback({',
-  '\t\tinstallAnchor: INSTALL_ANCHOR,',
-  '\t\tprofile',
-  '\t});',
-  '} catch (error) {',
-  '\tprocess.stderr.write(`dsh-desktop guard: healProfilesModuleFallback failed (${String(error?.message ?? error)}); continuing boot without fallback healing\n`);',
-  '}',
-].join('\n');
-
-/** heal 调用防护变换：入口 bundle 无该调用时静默原样返回（不算锚点失配）。 */
-function applyProfileBootHealGuard(src) {
-  if (typeof src !== 'string') return { changed: false, src };
-  if (src.includes(PROFILE_BOOT_HEAL_MARKER)) return { changed: false, src };
-  if (!src.includes(PROFILE_BOOT_HEAL_ANCHOR)) return { changed: false, src };
-  return { changed: true, src: src.replace(PROFILE_BOOT_HEAL_ANCHOR, PROFILE_BOOT_HEAL_GUARDED) };
-}
-
-// 0.1.5-rc.1 重锚：node:fs import 扩充（existsSync/mkdirSync/rmSync 已入 bundle）。
-const PROFILE_BOOT_IMPORT_ANCHOR = 'import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";';
-const PROFILE_BOOT_HOME_ANCHOR = '\tconst homePatches = loadOptionalPatches(NAME, homePatchPath()) ?? [];';
-const PROFILE_BOOT_LIVE_PROFILE_ANCHOR = '\t\t...loadOptionalPatches(NAME, composed.profile.patchPath) ?? [],';
-const PROFILE_BOOT_LIVE_HOME_ANCHOR = '\t\t...loadOptionalPatches(NAME, homePatchPath()) ?? [],';
-// 0.1.5-rc.1 重锚：export 别名重排（新增 initializeProfileFromDefault as i）。
-const PROFILE_BOOT_EXPORT_ANCHOR = 'export { prepareProfile as a, initializeProfileFromDefault as i, PROFILE_ROOT_FILENAME as n, resolveTelemetryPatch as o, homePatchPath as r, runProfile as s, INSTALL_ANCHOR as t };';
-
-const PROFILE_BOOT_GUARD_CODE = [
+const APP_BOOT_PATCH_LAYER_GUARD_CODE = [
   '/** dsh-desktop guard: the profile patch layer and the home-level patch layer',
   ' * (`$DSH_HOME/cordis.patch.yml`) are user-owned data; a broken file must not',
   ' * brick the boot or a hot-reload. Back the broken file up, reset the layer to',
   ' * an empty list, warn, and continue without it. */',
-  'function loadUserPatchLayerSafe(binName, file) {',
+  'function safeLoadUserPatchLayer(binName, file) {',
   '\ttry {',
   '\t\treturn loadOptionalPatches(binName, file) ?? [];',
   '\t} catch (error) {',
@@ -465,34 +405,29 @@ const PROFILE_BOOT_GUARD_CODE = [
 ].join('\n');
 
 /**
- * 改写 dsh/lib/profile-boot-*.js：家级 cordis.patch.yml 与 profile 补丁层的
- * 加载（composeProfile 与 HMR composeLive 三处）换成「损坏备份 + 重置 + 继续」。
- * 已注入或任一锚点失配时原样返回。
+ * 改写 dsh-app-boot/lib/index.js：用户拥有的两个补丁层文件（profile 自己的
+ * cordis.patch.yml 与家级 cordis.patch.yml）换成自愈读取（损坏备份 + 重置为空层 +
+ * 继续）。已注入或任一锚点失配时原样返回。
  * @returns {{ changed: boolean, src: string }}
  */
-function applyProfileBootBundleGuard(src) {
+function applyAppBootPatchLayerGuard(src) {
   if (typeof src !== 'string') return { changed: false, src };
-  if (src.includes(PROFILE_BOOT_GUARD_MARKER)) return { changed: false, src };
-  const anchors = [
-    PROFILE_BOOT_IMPORT_ANCHOR,
-    PROFILE_BOOT_HOME_ANCHOR,
-    PROFILE_BOOT_LIVE_PROFILE_ANCHOR,
-    PROFILE_BOOT_LIVE_HOME_ANCHOR,
-    PROFILE_BOOT_EXPORT_ANCHOR,
-  ];
-  if (!anchors.every((anchor) => src.includes(anchor))) return { changed: false, src };
+  if (src.includes(APP_BOOT_PATCH_LAYER_GUARD_MARKER)) return { changed: false, src };
+  if (
+    !src.includes(APP_BOOT_PATCH_LAYER_USER_ANCHOR)
+    || !src.includes(APP_BOOT_PATCH_LAYER_HOME_ANCHOR)
+    || !src.includes(APP_BOOT_PATCH_LAYER_INSERT_ANCHOR)
+  ) return { changed: false, src };
   let out = src
-    .replace(PROFILE_BOOT_IMPORT_ANCHOR, 'import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";')
-    .replace(PROFILE_BOOT_HOME_ANCHOR, '\tconst homePatches = loadUserPatchLayerSafe(NAME, homePatchPath());')
-    .replace(PROFILE_BOOT_LIVE_PROFILE_ANCHOR, '\t\t...loadUserPatchLayerSafe(NAME, composed.profile.patchPath),')
-    .replace(PROFILE_BOOT_LIVE_HOME_ANCHOR, '\t\t...loadUserPatchLayerSafe(NAME, homePatchPath()),');
-  out = out.replace(PROFILE_BOOT_EXPORT_ANCHOR, PROFILE_BOOT_EXPORT_ANCHOR + '\n\n' + PROFILE_BOOT_GUARD_CODE);
+    .replace(APP_BOOT_PATCH_LAYER_USER_ANCHOR, '\t\t...initialProfile?.patches ?? safeLoadUserPatchLayer(binName, context.patchPath),')
+    .replace(APP_BOOT_PATCH_LAYER_HOME_ANCHOR, '\t\t...safeLoadUserPatchLayer(binName, join(context.home, "cordis.patch.yml")),');
+  out = out.replace(APP_BOOT_PATCH_LAYER_INSERT_ANCHOR, APP_BOOT_PATCH_LAYER_GUARD_CODE + '\n\n' + APP_BOOT_PATCH_LAYER_INSERT_ANCHOR);
   return { changed: true, src: out };
 }
 
 module.exports = {
   PROFILE_BUNDLE_GUARD_MARKER,
-  PROFILE_BOOT_GUARD_MARKER,
+  APP_BOOT_PATCH_LAYER_GUARD_MARKER,
   BUNDLE_CHECK_CODES,
   bundlePatchRel,
   bundleEntryOf,
@@ -504,7 +439,5 @@ module.exports = {
   recoverManifestBundles,
   writeFileAtomic,
   applyAppBootBundleGuard,
-  applyProfileBootBundleGuard,
-  applyProfileBootHealGuard,
-  PROFILE_BOOT_HEAL_MARKER,
+  applyAppBootPatchLayerGuard,
 };

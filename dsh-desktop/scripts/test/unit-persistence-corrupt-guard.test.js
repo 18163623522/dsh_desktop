@@ -21,21 +21,26 @@ const {
   PERSISTENCE_TORN_HEAD_V2,
   PERSISTENCE_COMPLETE_CHECK_V1,
   PERSISTENCE_COMPLETE_CHECK_NEW,
+  PERSISTENCE_CORRUPT_OLD,
+  PERSISTENCE_FRAME_LOOP_OLD,
+  PERSISTENCE_WRITE_OLD,
+  PERSISTENCE_COMPLETE_CHECK,
+  PERSISTENCE_PKG_REL,
   transformPersistenceCorruptGuard,
   transformPersistenceAll,
 } = require('../lib/runtime-patches');
 
-// 以下锚点镜像 runtime-patches.js 的内部常量，与源文件逐字节一致，用于构造
-// 「未打补丁」的 fixtures（torn-tail 的注入体与两代首行已改为按引用取用，
-// 不再在测试里另抄字面串——抄的那份会变成第二处漂移源）。
-// rc.1 重锚：上游把 header 读取下沉进 readGenerationHeader(selected)，
-// corrupt-guard 的锚点从 alpha.5 的「listArtifacts 内联 const first = ...」读行
-// 改为「listArtifacts 包住 readGenerationHeader 调用的 catch(error)」——
-// 保留 SessionFormatUnsupportedError 先行 continue，其余告警 + continue。
-const CORRUPT_OLD = '\t\t\t\t} catch (error) {\n\t\t\t\t\tif (error instanceof SessionFormatUnsupportedError) continue;\n\t\t\t\t\tthrow error;\n\t\t\t\t}';
-const FRAME_LOOP_OLD = 'let remainingFrames = frames.length - 1;\n\t\t\tfor (const plaintext of decodedFrames) {';
-const WRITE_OLD = '\t\t\t\tscanner.write(plaintext);\n\t\t\t\tremainingFrames -= 1;';
-const COMPLETE_CHECK = '\t\t\tif (complete.committedBytes !== complete.inputBytes) throw new Error("corrupt Zstandard session log: complete frame contains a torn JSONL record");';
+// 锚点一律按引用取 runtime-patches 的生产常量，绝不再在测试里另抄字面串：
+// 此前这里镜像了一份 rc.1 字节，rc.2 重锚后成了第二处漂移源（5 条用例全红，
+// 而 patch-deps 是绿的——红区根本没在测生产锚点）。真实字节仍命中由下面的
+// 「pristine 哨兵」用例守着。
+// rc.1→rc.2 沿革：header 读取下沉进 readGenerationHeader(selected)，corrupt-guard
+// 的锚点是「listArtifacts 包住该调用的 catch(error)」——保留
+// SessionFormatUnsupportedError 先行 continue，其余告警 + continue。
+const CORRUPT_OLD = PERSISTENCE_CORRUPT_OLD;
+const FRAME_LOOP_OLD = PERSISTENCE_FRAME_LOOP_OLD;
+const WRITE_OLD = PERSISTENCE_WRITE_OLD;
+const COMPLETE_CHECK = PERSISTENCE_COMPLETE_CHECK;
 
 // 同时含「尾部撕裂」三个锚点 + 「损坏会话」锚点的完整原始源码。
 const FULL_SRC = [FRAME_LOOP_OLD, WRITE_OLD, COMPLETE_CHECK, CORRUPT_OLD].join('\n');
@@ -47,8 +52,10 @@ test('transformPersistenceCorruptGuard：匹配 → 改写 catch 跳过损坏会
   // 格式版本不兼容的先行 continue 分支保留，原先的无条件下钻 throw error 消失。
   assert.ok(changed.src.includes(PERSISTENCE_CORRUPT_MARKER), '应写入 corrupt-guard marker');
   assert.ok(changed.src.includes('} catch (error) {'), '应改写既有 catch 而非另起块');
-  assert.ok(changed.src.includes('if (error instanceof SessionFormatUnsupportedError) continue;'),
-    '格式版本不兼容先行 continue 应原样保留');
+  // rc.2：上游在这一层原生白名单了两类可读错误（格式不支持 / 持久化损坏），
+  // 本补丁的增量是「其余裸 Error 也告警跳过」，故先行 continue 是两类的形态。
+  assert.ok(changed.src.includes('if (error instanceof SessionFormatUnsupportedError || error instanceof SessionPersistenceCorruptionError) continue;'),
+    '上游白名单两类的先行 continue 应原样保留');
   assert.ok(changed.src.includes('skipping corrupt session log'), '告警文案应含 skipping corrupt session log');
   assert.ok(changed.src.includes('${selected.sourcePath}'), '告警应点出损坏会话文件（rc.1 取径 selected.sourcePath）');
   assert.ok(changed.src.includes('continue;'), '损坏时应 continue 跳过该会话');
@@ -156,4 +163,25 @@ test('transformPersistenceAll：尾部撕裂失配 + 损坏会话命中 → 仅�
   assert.equal(changed.status, 'changed');
   assert.ok(changed.src.includes(PERSISTENCE_CORRUPT_MARKER), '损坏会话 marker 应写入');
   assert.ok(!changed.src.includes(PERSISTENCE_TORN_MARKER), '尾部撕裂失配，不应写入其 marker');
+});
+
+// ---------------------------------------------------------------------------
+// pristine 哨兵：夹具按引用取生产常量后，本文件唯一能证明「这些常量仍是真实
+// 内核字节里的锚点」的判据。缺了它，锚点自己漂移时全套 fixture 用例照样全绿
+// （它们只会跟着一起改），而用户拿到的是「补丁静默不落地」。
+// ---------------------------------------------------------------------------
+
+const fs = require('node:fs');
+const { findPristineFile, describePristineRoots } = require('../lib/pristine-kernel-roots');
+
+const persistencePristine = findPristineFile(PERSISTENCE_PKG_REL);
+
+test('pristine 哨兵：两个锚点在真实 rc.2 内核字节里仍命中', {
+  skip: persistencePristine ? false : '无 pristine ' + PERSISTENCE_PKG_REL + '（查过 ' + describePristineRoots() + '）',
+}, () => {
+  const src = fs.readFileSync(persistencePristine, 'utf8');
+  assert.equal(transformPersistenceCorruptGuard(src, persistencePristine).status, 'changed',
+    'corrupt-guard 锚点在真实内核字节里应命中（失配=该重靶或退役，别改夹具蒙过去）');
+  assert.equal(transformPersistenceAll(src, persistencePristine).status, 'changed',
+    '组合变换在真实内核字节里应命中');
 });

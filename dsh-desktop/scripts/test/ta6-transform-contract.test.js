@@ -1,7 +1,7 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// TA6 元测试 2：transform 契约三态语义统一（37 个 file transform 逐个实跑）。
+// TA6 元测试 2：transform 契约三态语义统一（44 个 file transform 逐个实跑）。
 //
 // 对每个 transform 用三种输入各跑一遍：
 //   1) pristine 源（pristine-kernel-roots 给出的未补丁内核闭包树，历史上是
@@ -155,28 +155,23 @@ for (const spec of fileSpecs) {
   });
 }
 
-// 41 = 40（旧基线）+ conversation-assembly-resilience（BUG2 会话装配「可观测化 + 自愈」：
-// BoundConversation.accept 被静默吞的装配抛错 → 安全重建 + 去重告警）一条 file 补丁。
-// 44 = 43（上一基线，41→42 reasoning-row-collapse-width、43 session-unknown-event-tolerance）
-// + 1 条 released-v0-history-recovery（0.6.4：released-v0 准入清单扩容，靶
-// dsh-session-format-v0-to-v1/lib/index.js；覆盖用例由上方 `for (const spec of fileSpecs)`
-// 逐条生成，pristine 闭包树实跑 status=changed）。
-// 45 = 44 + 1 条 pi-ai-responses-tool-name-sanitize（靶 @earendil-works/pi-ai/dist/
-// api/openai-responses-shared.js，Responses 三条路由共用序列化的工具名清洗 + 回映射；
-// 与 pi-ai-tool-schema-sanitize 同为非闭包靶 → 本文件按诚实 SKIP 处理，见下方集合）。
-// 46 = 45 + 1 条 pi-ai-tool-name-wire（靶 @deepseek-ai/dsh-llm-pi-ai/lib/index.js：
-// 内核 ↔ pi-ai 唯一交界的 toolsOf() 出站 + 回程两处 tool-call 中央收口；此靶属
-// vendor/dsh-kernel 离线闭包 → 走上方逐条生成的正常覆盖用例，pristine 闭包树实跑
-// status=changed，不进诚实 SKIP 集合）。
-// 47 = 46 + 1 条 pi-ai-quota-not-retryable（靶 @earendil-works/pi-ai/dist/utils/
-// provider-retry.js：isRetryableProviderError 的配额耗尽终态判定；靶包属宿主可选
-// 依赖不在离线内核闭包 → 与同包另两条 pi-ai 补丁同口径，本文件按诚实 SKIP 处理，
-// 真实字节三态与功能面判定见 scripts/test/unit-pi-ai-quota-not-retryable.test.js）。
-test('契约面完整性：47 个 file transform 全部被本文件覆盖', () => {
-  assert.equal(fileSpecs.length, 47);
+// —— file 型规格数沿革（只记变化量，逐条理由见 patch-registry 与各 spec 注释）——
+// 41→47（0.6.2→0.6.4 逐条新增 conversation-assembly-resilience /
+//   reasoning-row-collapse-width / session-unknown-event-tolerance /
+//   released-v0-history-recovery / pi-ai-responses-tool-name-sanitize /
+//   pi-ai-tool-name-wire / pi-ai-quota-not-retryable）。
+//   其中 pi-ai 系三条里 openai-responses-shared.js 与 provider-retry.js 属宿主可选
+//   依赖、不在 vendor/dsh-kernel 离线闭包 → 本文件按诚实 SKIP 处理（见下方集合），
+//   真实字节三态见 scripts/test/unit-pi-ai-*.test.js；dsh-llm-pi-ai 那条属闭包，
+//   走上方逐条生成的正常覆盖用例。
+// 44 = 47（上一基线）− 3 条退役（0.2.0-rc.2 重靶）：loader-tree-isolation（靶
+//   cordis-plugin-loader 1.0.5 原生逐条目隔离）、settings-section-guard（register
+//   调用点全内核 0 命中）、fallback-heal-isolation（heal 回环原生逐名 try/catch）。
+test('契约面完整性：44 个 file transform 全部被本文件覆盖', () => {
+  assert.equal(fileSpecs.length, 44);
 });
 
-// 反「静默停摆」哨兵：诚实跳过集合必须恰为已知的 6 条非 vendored 目标——
+// 反「静默停摆」哨兵：诚实跳过集合必须恰为已知的 5 条非 vendored 目标——
 // 若集合扩大，说明有真·内核靶意外掉出闭包（应查 patch-target-resolver / vendor / pin）；
 // 若收缩，说明有人把 registry 包塞进 vendor/dsh-kernel（应显式更新此基线并复核语义）。
 // 任何漂移都变红并点名，杜绝「整组 t.skip」这类把守卫价值静默吞掉的形态。
@@ -187,6 +182,8 @@ test('契约面完整性：47 个 file transform 全部被本文件覆盖', () =
 // 0.1.6 迁移（2026-09-15）：loader-tree-isolation 移出——其靶 cordis-plugin-loader
 // 已被上游收编进 vendor/dsh-kernel（@deepseek-ai/cordis-plugin-loader@1.0.3），
 // 转入离线闭包，非闭包集合 6→5。
+// 0.2.0-rc.2 重靶：loader-tree-isolation 规格整体退役（1.0.5 原生逐条目隔离），
+// 集合仍为 5 条。
 const EXPECTED_NON_VENDORED = [
   'codex-local-bin-fallback',   // @openai/codex — 宿主可选依赖
   'pi-ai-4xx-dump',             // @earendil-works/pi-ai — 宿主可选依赖

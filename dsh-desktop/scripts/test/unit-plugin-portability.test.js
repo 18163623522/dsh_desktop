@@ -45,6 +45,14 @@ function collectJs(dir, out = []) {
 const DRIVE_ROOT_JOIN = /\bjoin\(\s*['"`][A-Za-z]:[\\/]{1,2}['"`]/;
 const DRIVE_ROOT_LITERAL = /['"`][A-Za-z]:[\\/]{1,2}[^'"`\s]*selftest/i;
 
+// 剥行尾注释。必须先去掉行尾 \r：`.` 不匹配 \r，而 CRLF 文件按 \n 切出来的每行都以
+// \r 结尾，`.*$` 因此在整个行上失配 —— 结果是「注释剥离」静默退化成「什么都不剥」，
+// 一句写着历史反面教材的注释被判成违规（本机 w/crlf、CI 检出 i/lf，故这是一个
+// 只在 Windows 上出现的假红）。
+function stripLineComment(line) {
+  return line.replace(/\r$/, '').replace(/\/\/.*$/, '');
+}
+
 test('插件运行期代码不得把目录硬编码到固定盘符根（可移植性）', () => {
   const offenders = [];
   for (const plugin of fs.readdirSync(PLUGINS)) {
@@ -53,7 +61,7 @@ test('插件运行期代码不得把目录硬编码到固定盘符根（可移�
     for (const file of collectJs(lib)) {
       const lines = fs.readFileSync(file, 'utf8').split('\n');
       lines.forEach((line, i) => {
-        const code = line.replace(/\/\/.*$/, ''); // 去掉行尾注释，避免"注释里提到"误判
+        const code = stripLineComment(line);
         if (DRIVE_ROOT_JOIN.test(code) || DRIVE_ROOT_LITERAL.test(code)) {
           offenders.push(`${path.relative(PLUGINS, file)}:${i + 1}  ${line.trim().slice(0, 120)}`);
         }
@@ -65,6 +73,30 @@ test('插件运行期代码不得把目录硬编码到固定盘符根（可移�
     [],
     '以下位置把运行期目录硬编码到了固定盘符根（在没有该盘/不可写的机器上会抛错，并往盘根写东西）。' +
       '应改为挂在 DSH_HOME / 插件数据目录下的固定子目录：\n' + offenders.join('\n'),
+  );
+});
+
+// 反证：注释剥离必须真的起作用，同时不能把真代码放过去。判据缺一，上面那条守卫
+// 就分别在「常红」和「常绿」之间失去捕获力。
+test('反证：注释剥离对 LF 与 CRLF 等价，且不放过真代码里的盘符根', () => {
+  const commentLf = '  // 旧实现硬编码 `D:/someone/selftest-runner`，';
+  assert.strictEqual(stripLineComment(commentLf), '  ', 'LF 行尾：整行注释必须被剥光');
+  assert.strictEqual(
+    stripLineComment(commentLf + '\r'),
+    '  ',
+    'CRLF 行尾：必须与 LF 同判（回归 2026-10-05 的 Windows-only 假红）',
+  );
+
+  const codeLine = "const dir = join('D:/', 'work'); // 说明";
+  assert.strictEqual(
+    stripLineComment(codeLine + '\r'),
+    "const dir = join('D:/', 'work'); ",
+    '行尾注释只剥注释，代码部分必须原样保留',
+  );
+  assert.ok(DRIVE_ROOT_JOIN.test(stripLineComment(codeLine + '\r')), '真代码里的 join(盘符根) 必须仍被捕获');
+  assert.ok(
+    DRIVE_ROOT_LITERAL.test(stripLineComment('const p = `D:/dsh/selftest-runner`; // 说明\r')),
+    '真代码里写死的 selftest 盘符根字符串必须仍被捕获',
   );
 });
 

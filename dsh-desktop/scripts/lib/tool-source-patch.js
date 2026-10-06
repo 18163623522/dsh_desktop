@@ -37,12 +37,13 @@ const TOOL_SOURCE_NEW_1 = [
   '\t\t// producing tool/result events whose source.callId is "" — restore validation then',
   '\t\t// bricked the whole session. Synthesize a stable callId so stored sessions reopen;',
   '\t\t// the write side (dsh-agent-loop) is separately guarded against new empty ids.',
+  '\t\t// 0.2.0-rc.2：callId 的镜像位从 content[0] 块上移到消息记录自身',
+  '\t\t// （messageRecord["toolCallId"]），校验与修复都按新位置走。',
   '\t\ttry {',
   '\t\t\tif (sourceRecord["kind"] !== "tool") sourceRecord["kind"] = "tool";',
-  '\t\t\tconst __tBlock = Array.isArray(messageRecord["content"]) ? messageRecord["content"][0] : void 0;',
-  '\t\t\tconst __tBlockId = __tBlock && typeof __tBlock === "object" && __tBlock["type"] === "tool-result" && typeof __tBlock["toolCallId"] === "string" ? __tBlock["toolCallId"] : "";',
-  '\t\t\tif (typeof sourceRecord["callId"] !== "string" || sourceRecord["callId"] === "") sourceRecord["callId"] = __tBlockId !== "" ? __tBlockId : "recovered-seq-" + String(event["seq"] ?? "na");',
-  '\t\t\tif (__tBlock && typeof __tBlock === "object" && __tBlock["type"] === "tool-result" && __tBlock["toolCallId"] !== sourceRecord["callId"]) __tBlock["toolCallId"] = sourceRecord["callId"];',
+  '\t\t\tconst __tMessageId = typeof messageRecord["toolCallId"] === "string" ? messageRecord["toolCallId"] : "";',
+  '\t\t\tif (typeof sourceRecord["callId"] !== "string" || sourceRecord["callId"] === "") sourceRecord["callId"] = __tMessageId !== "" ? __tMessageId : "recovered-seq-" + String(event["seq"] ?? "na");',
+  '\t\t\tif (messageRecord["toolCallId"] !== sourceRecord["callId"]) messageRecord["toolCallId"] = sourceRecord["callId"];',
   '\t\t\tconsole.warn("[dsh-session] tool source repaired at " + subject + " (empty callId tolerated)");',
   '\t\t} catch {',
   '\t\t\tthrow new Error(`${subject} message must have tool source`);',
@@ -51,18 +52,18 @@ const TOOL_SOURCE_NEW_1 = [
 ].join('\n');
 
 const TOOL_SOURCE_OLD_2 = [
-  '\tif (block["toolCallId"] !== sourceRecord["callId"]) throw new Error(`${subject} message has mismatched tool call ids`);',
+  '\tif (messageRecord["toolCallId"] !== sourceRecord["callId"]) throw new Error(`${subject} message has mismatched tool call ids`);',
 ].join('\n');
 
 const TOOL_SOURCE_NEW_2 = [
-  '\tif (block["toolCallId"] !== sourceRecord["callId"]) {',
+  '\tif (messageRecord["toolCallId"] !== sourceRecord["callId"]) {',
   '\t\t// ' + TOOL_SOURCE_MARKER + '. A mismatch where one side is empty is the empty-callId',
   '\t\t// artifact (frozen content or a path the repair above could not normalize): adopt the',
   '\t\t// non-empty side. Two different NON-empty ids stay a hard corruption.',
-  '\t\tif (block["toolCallId"] === "" || block["toolCallId"] === void 0) {',
-  '\t\t\ttry { block["toolCallId"] = sourceRecord["callId"]; } catch { throw new Error(`${subject} message has mismatched tool call ids`); }',
+  '\t\tif (messageRecord["toolCallId"] === "" || messageRecord["toolCallId"] === void 0) {',
+  '\t\t\ttry { messageRecord["toolCallId"] = sourceRecord["callId"]; } catch { throw new Error(`${subject} message has mismatched tool call ids`); }',
   '\t\t} else if (typeof sourceRecord["callId"] !== "string" || sourceRecord["callId"] === "") {',
-  '\t\t\ttry { sourceRecord["callId"] = block["toolCallId"]; } catch { throw new Error(`${subject} message has mismatched tool call ids`); }',
+  '\t\t\ttry { sourceRecord["callId"] = messageRecord["toolCallId"]; } catch { throw new Error(`${subject} message has mismatched tool call ids`); }',
   '\t\t} else {',
   '\t\t\tthrow new Error(`${subject} message has mismatched tool call ids`);',
   '\t\t}',

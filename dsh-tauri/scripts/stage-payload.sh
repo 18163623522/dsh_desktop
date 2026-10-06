@@ -2,11 +2,13 @@
 # stage-payload.sh —— 打包前置：暂存运行时 payload 到 package-payload/dsh-desktop/
 # ==========================================================================
 # Tauri 安装包的内核资源（supervisor 的 app_dir）。从 dsh-desktop/ 源头按
-# 「Electron extraResources + 生产依赖」口径组装，排除三类大件：
+# 「Electron extraResources + 生产依赖」口径组装，排除四类大件/杂质：
 #   1. dist/            —— 旧构建产物（>2GB，与运行时无关）
 #   2. node_modules 的 devDependencies（electron / electron-builder /
 #      electron-winstaller）——Electron 运行时与打包器，Tauri 版不需要
 #   3. vendor/node/node —— unix node 二进制（115MB，win-x64 包只带 node.exe）
+#   4. assets/{plugins,agent-presets} —— 内置插件与随包预设（v1.0.0 起对齐官方
+#      交付形态：仓库保留源，安装包不带；口径与失效语义见下方 assets 段）
 #
 # 产出布局（resources 映射 → <安装根>/resources/dsh-desktop/，
 # 与 lib.rs find_repo_root 的 exe-walk resources/ 子布局回退一致）：
@@ -55,12 +57,14 @@ echo "[stage] DEBUG: uname=$(uname -s) NODE_BIN=$NODE_BIN"
 echo "[stage] DEBUG: node exists: $(ls -la "$SRC/vendor/node/$NODE_BIN" 2>&1)"
 echo "[stage] DEBUG: bin.js exists: $(ls "$SRC/node_modules/@deepseek-ai/dsh/lib/bin.js" 2>&1)"
 echo "[stage] DEBUG: package.json exists: $(ls "$SRC/package.json" 2>&1)"
-echo "[stage] DEBUG: assets/plugins exists: $(ls -d "$SRC/assets/plugins" 2>&1)"
+echo "[stage] DEBUG: assets/ 顶层: $(ls "$SRC/assets" 2>&1 | tr '\n' ' ')"
 echo "[stage] DEBUG: node_modules count: $(ls "$SRC/node_modules" 2>/dev/null | wc -l)"
 
+# 必需件清单里**不含** assets/plugins 与 assets/agent-presets：v1.0.0 纯净线不把
+# 它们装进包（下方 assets 段显式剔除），装出来缺了反而才对。
 for f in package.json "vendor/node/$NODE_BIN" \
          node_modules/@deepseek-ai/dsh/lib/bin.js \
-         scripts/lib/companion-profile.js assets/plugins; do
+         scripts/lib/companion-profile.js; do
   if [ ! -e "$SRC/$f" ]; then
     echo "[stage] 缺少运行时必需件: dsh-desktop/$f —— 先在 dsh-desktop/ npm install" >&2
     exit 1
@@ -83,32 +87,46 @@ rc() { mirror_dir "$1" "$2"; }
     [ -f "$f" ] && cp -f "$f" "$DST/"
   done
 
-# ---- scripts / assets：全量镜像 ----
-# assets 下混着两类 node_modules，必须区别对待（v0.6.2 本地构建踩坑定案）：
-#   • 正件：dsh-hub（731 个跟踪文件）/ graph-memory（1177）/ billion-context-dsh
-#     （165）的 node_modules 是 git 跟踪进来的，插件运行期直接 require 它们，
-#     剔掉就是装完即挂（“全量 /XD node_modules”的错法，CI 口径也会被打穿）。
-#   • 残留：插件目录里本机跑过 pnpm/npm install 留下的 node_modules（gitignored，
-#     实测本晚 dsh-better-sidebar pnpm install 出 433MB）。pnpm 的 .pnpm 内容存储被
-#     robocopy 跟 junction 展开成真实路径后，NSIS 的 File 指令在 >260 字符处
-#     “failed opening file”直接中断建包（abort 于 installer.nsi:15383）。
-# 手法：//XD .pnpm 先把唯一会撑爆路径的形态挡在复制之外（全仓无任何被跟踪的
-# .pnpm 路径，三个正件树内也无），再按「git 有无跟踪」逐个剔除本地安装残留——
-# 判据自描述，新增正件插件无需改脚本；非 git 工作树（如发布 tarball 构建）
-# 整体跳过，宁留不误删。/XD 同时挡住 /MIR 删除，故 .pnpm 残留另需一行显式清理。
+# ---- scripts / assets：镜像 + 纯净线收口 ----
+# v1.0.0 与官方桌面客户端对齐的交付形态：官方不随包第三方插件、也不注入自定义
+# agent 预设，所以 `assets/{plugins,agent-presets}` 只留在仓库里（开发树、约 25 个
+# 单测与同步链仍以它们为源），**不进安装包**。
+#
+# 剔掉之后运行期不会报错，两条链都是 fail-open，但语义不一样，都得知道：
+#   • boot 的 sync 步把「源缺失」的 40 个配套件计入 missingNames，随后**主动撤回**
+#     已装过的 cordis.patch 条目与 bundle 注册 —— 所以 COMPANION_PLUGINS 清单必须
+#     保持完整。清空清单会让老用户升级后留下一堆指向缺失目录的注册行，装配失败
+#     表现为 "entries did not activate"，一次致命启动会把 profile 的补丁层整体抹掉。
+#   • 预设侧 listPresetSlots 读不到源根返回空清单 → 安装 0 个内置预设；
+#     已装进 <DSH_HOME>/.agent-presets 的旧副本**不自动删**（那是用户目录下可能被
+#     改过的文件，稳定性原则③「用户数据不动」优先于形态纯净）。
+#
+# 手法：//XD 只是 Windows 快路径（少拷 73MB），真正的口径是镜像后的无条件 rm。
+# 两个理由都是实测过的坑：robocopy /XD 把排除项同时挡在「复制」与「/MIR 删除」
+# 之外，上一代 payload 里已有的 assets/plugins 不会被 /MIR 清掉；而 mirror_dir 的
+# unix 分支（CI linux/mac）根本不读附加参数，只靠 //XD 会造出
+# 「win 纯净、linux/mac 仍带插件」的双形态包。
+# .pnpm 那一层仍是必需的：assets 下混着两类 node_modules ——
+#   • 正件：dsh-hub(731 个跟踪文件) / graph-memory(1177) / billion-context-dsh(165)
+#     的 node_modules 是 git 跟踪进来的运行期依赖（本条对**未剔 plugins 的其它形态**
+#     才相关，别再对 assets 一刀切 /XD node_modules）。
+#   • 残留：插件目录里本机 pnpm/npm install 留下的 gitignored node_modules（实测
+#     433MB），其 .pnpm 存储被 robocopy 跟 junction 展开成真实路径后，NSIS 的 File
+#     指令在 >260 字符处 "failed opening file" 直接中断建包（abort 于 installer.nsi:15383）。
 mirror_dir "$SRC/scripts" "$DST/scripts"
-mirror_dir "$SRC/assets" "$DST/assets" //XD .pnpm
+mirror_dir "$SRC/assets" "$DST/assets" //XD .pnpm plugins agent-presets
 find "$DST/assets" -type d -name .pnpm -prune -exec rm -rf {} + 2>/dev/null || true
-if [ -n "$(git -C "$REPO_ROOT" rev-parse --is-inside-work-tree 2>/dev/null)" ]; then
-  for d in "$DST/assets/plugins"/*/; do
-    [ -d "$d/node_modules" ] || continue
-    name="$(basename "$d")"
-    if [ -z "$(git -C "$REPO_ROOT" ls-files -- "dsh-desktop/assets/plugins/$name/node_modules" | head -1)" ]; then
-      echo "[stage] 剔除 gitignored 插件依赖树（本机安装残留）: $name/node_modules"
-      rm -rf "$d/node_modules"
-    fi
-  done
-fi
+rm -rf "$DST/assets/plugins" "$DST/assets/agent-presets"
+
+# 纯净形态门禁：与上面的 rm 互为反证（排除面被改动 / 上游重新引入镜像时立刻红，
+# 而不是等到装出来一个带插件的"纯净版"）。
+for d in assets/plugins assets/agent-presets; do
+  if [ -e "$DST/$d" ]; then
+    echo "[stage] FATAL: 纯净线 payload 混入 $d，拒绝打包" >&2
+    exit 1
+  fi
+done
+echo "[stage] OK: 纯净线形态 —— payload 不含内置插件与随包预设（仓库源保留）"
 
 # ---- vendor：node 二进制（$NODE_BIN——win 为 node.exe，unix 为 node）+ npm 全量（插件安装/更新链用到）----
 # PD1 对账修复：历史 staging 残留会把另一平台的 node 二进制留在 DST（本机

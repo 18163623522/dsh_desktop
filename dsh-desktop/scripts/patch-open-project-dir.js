@@ -8,20 +8,24 @@
 // 扩展：
 //
 //   1. 项目行菜单（workspaceMenuItems）末尾追加 open-folder 项（文件夹图标），
-//      点击调 window.__dshDesktopOpenDir?.(row.cwd)；
-//   2. 会话行菜单（sessionMenuItems）末尾按需追加 open-folder 项 —— 仅在能
-//      解析到 cwd 时显示（分组视图取 group.cwd，扁平视图从 list.byId 反查
-//      list.byId[node.id]?.cwd），未分组 / 孤儿会话自动隐藏；
+//      点击调 window.dshDesktop.openPath(row.cwd)；
+//   2. 会话行「打开项目目录」—— 0.2.0-rc.2 起重锚为 slot 注册：上游把会话行
+//      ⋯ 菜单从内联数组改成 sidebar.workspaces.session.menu.item 列表（pin 100 /
+//      rename 200 / fork 300 / archive 400），本补丁注册 order 500 的
+//      OpenProjectDirMenuItem，cwd 由注入闭包从 sessions 快照反查，查不到
+//      （孤儿 / 未分组会话）或桥缺失时整行不渲染；
 //   3. 项目行 / 会话行 div 增加 onContextMenu：preventDefault + stopPropagation
 //      后在同一个菜单以光标坐标弹出（getAnchorRect 提供完整四边矩形
 //      left/top/right/bottom，right=x+1、bottom=y+1 —— 修复只给左/上两边的
 //      初版实现：align=start + side=bottom 时 y 变 NaN，portal 落到静态位置）；
 //   4. 菜单锚点矩形统一走 getAnchorRect：⋯ 按钮点击时返回按钮矩形，右键时
-//      返回光标矩形。
+//      返回光标矩形。primitives 的 Menu 在本版内核仍支持该形参
+//      （@deepseek-ai/dsh-client-ui-primitives/lib/index.js 参数清单可见）。
 //
-// 桥 openPath 为 preload 已暴露的宿主能力 window.dshDesktop.openPath（显式
-// 直接引用，不再经 dsh-session-manager 插件的 window.__dshDesktopOpenDir 别名
-// 中转）；桥缺失时（纯浏览器）`?.` 可选链静默降级为无操作。
+// 桥 openPath 为本项目 Tauri 宿主自己暴露的能力
+// （src-tauri/crates/bridge/dist/bridge-shim.js 里 window.dshDesktop.openPath →
+// invoke file_open），不是官方全局对象；桥缺失时（纯浏览器）`?.` 可选链静默
+// 降级为无操作，且会话行菜单项直接不渲染。
 //
 // 用法：
 //   node scripts/patch-open-project-dir.js [<node_modules 根目录>]
@@ -40,8 +44,8 @@ const MARKER = 'dsh-desktop patch (open project dir)';
 // ---------------------------------------------------------------------------
 
 // 1a. 项目行菜单项数组：delete 项后追加 open-folder 项。
-const UI_PROJECT_ITEMS_ANCHOR = '}, {\n\t\t\t\tid: "delete",\n\t\t\t\tlabel: t("delete.workspace"),\n\t\t\t\ticon: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconTrashOutline16, {}),\n\t\t\t\tdanger: true\n\t\t\t}];';
-const UI_PROJECT_ITEMS_INSERT = '}, {\n\t\t\t\tid: "delete",\n\t\t\t\tlabel: t("delete.workspace"),\n\t\t\t\ticon: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconTrashOutline16, {}),\n\t\t\t\tdanger: true\n\t\t\t}, {\n\t\t\t\t// dsh-desktop patch (open project dir): 打开项目目录。\n\t\t\t\tid: "open-folder",\n\t\t\t\tlabel: t("menu.openProjectDir"),\n\t\t\t\ticon: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderOpen16, {})\n\t\t\t}];';
+const UI_PROJECT_ITEMS_ANCHOR = "}, {\n\t\t\t\tid: \"delete\",\n\t\t\t\tlabel: t(\"delete.workspace\"),\n\t\t\t\ticon: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconTrashOutlineRegular, {}),\n\t\t\t\tdanger: true\n\t\t\t}];";
+const UI_PROJECT_ITEMS_INSERT = "}, {\n\t\t\t\tid: \"delete\",\n\t\t\t\tlabel: t(\"delete.workspace\"),\n\t\t\t\ticon: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconTrashOutlineRegular, {}),\n\t\t\t\tdanger: true\n\t\t\t}, {\n\t\t\t\t// dsh-desktop patch (open project dir): 打开项目目录。\n\t\t\t\tid: \"open-folder\",\n\t\t\t\tlabel: t(\"menu.openProjectDir\"),\n\t\t\t\ticon: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderOpenRegular, {})\n\t\t\t}];";
 
 // 1b. 项目行菜单 onSelect：放行 open-folder 并调用桥。
 const UI_PROJECT_SELECT_ANCHOR = 'if (id !== "rename" && id !== "delete") return;\n\t\t\t\t\t\t\t\tif (id === "rename") actions.rename();\n\t\t\t\t\t\t\t\telse actions.delete();';
@@ -52,8 +56,8 @@ const UI_PROJECT_DIV_ANCHOR = 'role: "treeitem",\n\t\t\t\t"aria-expanded": row.e
 const UI_PROJECT_DIV_INSERT = 'role: "treeitem",\n\t\t\t\t"aria-expanded": row.expanded,\n\t\t\t\tonClick: onToggle,\n\t\t\t\tonContextMenu: (e) => {\n\t\t\t\t\te.preventDefault();\n\t\t\t\t\te.stopPropagation();\n\t\t\t\t\tif (actions === void 0) return;\n\t\t\t\t\tsetMenuRect({ left: e.clientX, top: e.clientY, right: e.clientX + 1, bottom: e.clientY + 1 });\n\t\t\t\t\tsetMenuOpen(true);\n\t\t\t\t},';
 
 // 1d. 项目行：右键锚点矩形 state。
-const UI_PROJECT_STATE_ANCHOR = 'const active = group.expanded && group.containsCurrent;\n\t\t\tconst [menuOpen, setMenuOpen] = (0, react.useState)(false);';
-const UI_PROJECT_STATE_INSERT = 'const active = group.expanded && group.containsCurrent;\n\t\t\tconst [menuOpen, setMenuOpen] = (0, react.useState)(false);\n\t\t\tconst [menuRect, setMenuRect] = (0, react.useState)(null);';
+const UI_PROJECT_STATE_ANCHOR = "const active = containsCurrentDescendant || group.expanded && group.containsCurrent;\n\t\t\tconst [menuOpen, setMenuOpen] = (0, react.useState)(false);";
+const UI_PROJECT_STATE_INSERT = "const active = containsCurrentDescendant || group.expanded && group.containsCurrent;\n\t\t\tconst [menuOpen, setMenuOpen] = (0, react.useState)(false);\n\t\t\tconst [menuRect, setMenuRect] = (0, react.useState)(null);";
 
 // 1e. 项目行 Menu：锚点矩形统一走 getAnchorRect（portal 定位用）。
 const UI_PROJECT_ANCHOR_ANCHOR = 'items: workspaceMenuItems,\n\t\t\t\t\t\t\tonSelect: (id) => {';
@@ -63,50 +67,42 @@ const UI_PROJECT_ANCHOR_INSERT = 'items: workspaceMenuItems,\n\t\t\t\t\t\t\tgetA
 const UI_PROJECT_BUTTON_ANCHOR = '"aria-label": t("actions.workspace.aria", { name: label }),\n\t\t\t\t\t\t\t\tonClick: (e) => {\n\t\t\t\t\t\t\t\t\te.stopPropagation();\n\t\t\t\t\t\t\t\t\tsetMenuOpen((v) => !v);\n\t\t\t\t\t\t\t\t},';
 const UI_PROJECT_BUTTON_INSERT = '"aria-label": t("actions.workspace.aria", { name: label }),\n\t\t\t\t\t\t\t\tonClick: (e) => {\n\t\t\t\t\t\t\t\t\te.stopPropagation();\n\t\t\t\t\t\t\t\t\tsetMenuRect(e.currentTarget.getBoundingClientRect());\n\t\t\t\t\t\t\t\t\tsetMenuOpen((v) => !v);\n\t\t\t\t\t\t\t\t},';
 
-// 2a. 会话行组件签名：新增 cwd prop（分组视图 group.cwd / 扁平视图反查 list.byId）。
-// 0.1.5-rc.1 重锚：上游新增 onReveal 形参（置于 onArchive 与 drag 之间）。
-const UI_SESSION_SIG_ANCHOR = 'function SessionNodeItem({ node, currentId, now, onOpen, onRename, onFork, onArchive, onReveal, drag, flat = false, t }) {';
-const UI_SESSION_SIG_INSERT = 'function SessionNodeItem({ node, currentId, now, onOpen, onRename, onFork, onArchive, onReveal, drag, flat = false, t, cwd }) {';
+// 2a. 会话行「打开项目目录」：0.2.0-rc.2 重锚。
+// 上游把会话行 ⋯ 菜单从内联数组改成了 sidebar.workspaces.session.menu.item 的
+// slot 列表，SessionNodeItem 不再有 sessionMenuItems / onSelect / onRename/onFork/
+// onArchive 形参，也不接收 cwd prop。本层随之改为「注册一个 slot 行」：组件
+// OpenProjectDirMenuItem + props 闭包 openDirInjected + 一条 slots.register
+// （order 500）。cwd 由注入闭包从 sessions 快照反查，因此旧的「组件签名加 cwd
+// prop + 两处调用点传 cwd」三项一并退役。
+const UI_SESSION_COMP_ANCHOR = "\t\tfunction ArchiveSessionMenuItem({ sessionId, useArchived, useMenuOpenState, useShortcuts, archiveSession, unarchiveSession, t }) {";
+const UI_SESSION_COMP_INSERT = "\t\t/**\n\t\t* dsh-desktop patch (open project dir): Menu row (order 500): 打开会话所在项目\n\t\t* 目录。cwd 从 sessions 快照反查（孤儿/未分组会话查不到即整行不渲染）；\n\t\t* 宿主桥 window.dshDesktop.openPath 缺失（纯浏览器）时同样不渲染。\n\t\t* @param props - 菜单开闭态、cwd 反查与打开动作。\n\t\t* @returns the row, or nothing when there is no directory to open.\n\t\t*/\n\t\tfunction OpenProjectDirMenuItem({ sessionId, useMenuOpenState, sessionCwd, canOpenDir, openSessionDir, t }) {\n\t\t\tconst [, setMenuOpen] = useMenuOpenState();\n\t\t\tconst cwd = sessionCwd(sessionId);\n\t\t\tif (cwd === void 0 || !canOpenDir) return null;\n\t\t\treturn (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.MenuItemButton, {\n\t\t\t\ticon: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderOpenRegular, { size: 14 }),\n\t\t\t\tonSelect: () => {\n\t\t\t\t\tsetMenuOpen(false);\n\t\t\t\t\topenSessionDir(sessionId, cwd);\n\t\t\t\t},\n\t\t\t\tchildren: t(\"menu.openProjectDir\")\n\t\t\t});\n\t\t}\n\t\tfunction ArchiveSessionMenuItem({ sessionId, useArchived, useMenuOpenState, useShortcuts, archiveSession, unarchiveSession, t }) {";
+const UI_SESSION_INJECT_ANCHOR = "\t\t\tconst archiveInjected = () => ({";
+const UI_SESSION_INJECT_INSERT = "\t\t\t// dsh-desktop patch (open project dir): 「打开项目目录」的 props 注入闭包。\n\t\t\t// 闭包拿不到 sessionId（slot 的 inject 是无参工厂），故把 cwd 反查做成函数\n\t\t\t// 交给组件；桥为 preload 暴露的 window.dshDesktop.openPath（本仓库自己的\n\t\t\t// 宿主桥，非官方同名全局），缺失时组件不渲染该行。\n\t\t\tconst openDirInjected = () => ({\n\t\t\t\tsessionCwd: (sessionId) => sessions.list.getSnapshot().byId[sessionId]?.cwd,\n\t\t\t\tcanOpenDir: typeof window.dshDesktop?.openPath === \"function\",\n\t\t\t\topenSessionDir: (sessionId, cwd) => {\n\t\t\t\t\twindow.dshDesktop?.openPath?.(cwd ?? sessions.list.getSnapshot().byId[sessionId]?.cwd);\n\t\t\t\t}\n\t\t\t});\n\t\t\tconst archiveInjected = () => ({";
+const UI_SESSION_REG_ANCHOR = "\t\t\t\t\tid: \"archive\",\n\t\t\t\t\torder: 400,\n\t\t\t\t\tlocale: NS,\n\t\t\t\t\tinject: archiveInjected\n\t\t\t\t}, ArchiveSessionMenuItem);";
+const UI_SESSION_REG_INSERT = "\t\t\t\t\tid: \"archive\",\n\t\t\t\t\torder: 400,\n\t\t\t\t\tlocale: NS,\n\t\t\t\t\tinject: archiveInjected\n\t\t\t\t}, ArchiveSessionMenuItem);\n\t\t\t\t// dsh-desktop patch (open project dir): 会话行菜单增加「打开项目目录」（order 500）。\n\t\t\t\tyield ctx.slots.register({\n\t\t\t\t\tname: \"sidebar.workspaces.session.menu.item\",\n\t\t\t\t\tid: \"open-folder\",\n\t\t\t\t\torder: 500,\n\t\t\t\t\tlocale: NS,\n\t\t\t\t\tinject: openDirInjected\n\t\t\t\t}, OpenProjectDirMenuItem);";
 
-// 2b. 会话行：右键锚点矩形 state。0.1.6 在 showStatus 与 menuOpen 之间新增
-// draggable 行，锚点随之扩一行。
-const UI_SESSION_STATE_ANCHOR = 'const showStatus = statuses[0].state !== "done" || row.completed;\n\t\t\tconst draggable = drag !== void 0 && !row.blank;\n\t\t\tconst [menuOpen, setMenuOpen] = (0, react.useState)(false);';
-const UI_SESSION_STATE_INSERT = 'const showStatus = statuses[0].state !== "done" || row.completed;\n\t\t\tconst draggable = drag !== void 0 && !row.blank;\n\t\t\tconst [menuOpen, setMenuOpen] = (0, react.useState)(false);\n\t\t\tconst [menuRect, setMenuRect] = (0, react.useState)(null);';
-
-// 2c. 会话行菜单项数组：delete 项后按需追加 open-folder（无 cwd 不显示）。
-const UI_SESSION_ITEMS_ANCHOR = '// dsh-desktop patch (session manage): 归档下方增加删除。\n\t\t\t\t// 桥 window.__dshSessionManager 由 dsh-session-manager 插件提供；桥缺失\n\t\t\t\t// 时隐藏「删除对话」项（显式降级，而非可选链静默无反应）。\n\t\t\t\t...(window.__dshSessionManager && typeof window.__dshSessionManager.deleteSession === "function" ? [{\n\t\t\t\t\tid: "delete",\n\t\t\t\t\tlabel: t("menu.deleteSession")\n\t\t\t\t}] : [])\n\t\t\t];';
-const UI_SESSION_ITEMS_INSERT = '// dsh-desktop patch (session manage): 归档下方增加删除。\n\t\t\t\t// 桥 window.__dshSessionManager 由 dsh-session-manager 插件提供；桥缺失\n\t\t\t\t// 时隐藏「删除对话」项（显式降级，而非可选链静默无反应）。\n\t\t\t\t...(window.__dshSessionManager && typeof window.__dshSessionManager.deleteSession === "function" ? [{\n\t\t\t\t\tid: "delete",\n\t\t\t\t\tlabel: t("menu.deleteSession")\n\t\t\t\t}] : []),\n\t\t\t\t// dsh-desktop patch (open project dir): 打开会话所在项目目录（无 cwd 的孤儿/未分组会话不显示）。\n\t\t\t\t...(cwd ? [{\n\t\t\t\t\tid: "open-folder",\n\t\t\t\t\tlabel: t("menu.openProjectDir"),\n\t\t\t\t\ticon: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderOpen16, {})\n\t\t\t\t}] : [])\n\t\t\t];';
-
-// 2d. 会话行菜单 onSelect：open-folder 调用桥。
-const UI_SESSION_SELECT_ANCHOR = 'if (id === "delete") window.__dshSessionManager?.deleteSession(node.id);';
-const UI_SESSION_SELECT_INSERT = 'if (id === "delete") window.__dshSessionManager?.deleteSession(node.id);\n\t\t\t\t\t\t\t\t\tif (id === "open-folder") window.dshDesktop?.openPath?.(cwd);';
+// 2b. 会话行：右键锚点矩形 state。
+const UI_SESSION_STATE_ANCHOR = "\t\t\tconst [menuOpen, setMenuOpen] = (0, react.useState)(false);\n\t\t\tconst menuOpenState = (0, react.useMemo)(() => [menuOpen, setMenuOpen], [menuOpen]);";
+const UI_SESSION_STATE_INSERT = "\t\t\tconst [menuOpen, setMenuOpen] = (0, react.useState)(false);\n\t\t\tconst menuOpenState = (0, react.useMemo)(() => [menuOpen, setMenuOpen], [menuOpen]);\n\t\t\tconst [menuRect, setMenuRect] = (0, react.useState)(null);";
 
 // 2e. 会话行 div：右键弹出同一菜单（光标锚点；blank 占位行无菜单不弹）。
-const UI_SESSION_DIV_ANCHOR = '"aria-selected": selected,\n\t\t\t\t\tonClick: () => {\n\t\t\t\t\t\tonOpen(node.id);\n\t\t\t\t\t},';
-const UI_SESSION_DIV_INSERT = '"aria-selected": selected,\n\t\t\t\t\tonClick: () => {\n\t\t\t\t\t\tonOpen(node.id);\n\t\t\t\t\t},\n\t\t\t\t\tonContextMenu: (e) => {\n\t\t\t\t\t\te.preventDefault();\n\t\t\t\t\t\te.stopPropagation();\n\t\t\t\t\t\tif (row.blank) return;\n\t\t\t\t\t\tsetMenuRect({ left: e.clientX, top: e.clientY, right: e.clientX + 1, bottom: e.clientY + 1 });\n\t\t\t\t\t\tsetMenuOpen(true);\n\t\t\t\t\t},';
+const UI_SESSION_DIV_ANCHOR = "\t\t\t\t\t\"aria-selected\": selected,\n\t\t\t\t\t\"aria-description\": row.archived ? t(\"toast.archivedNotOpenable\") : void 0,\n\t\t\t\t\tonClick: () => {\n\t\t\t\t\t\tonOpen(node.id);\n\t\t\t\t\t},";
+const UI_SESSION_DIV_INSERT = "\t\t\t\t\t\"aria-selected\": selected,\n\t\t\t\t\t\"aria-description\": row.archived ? t(\"toast.archivedNotOpenable\") : void 0,\n\t\t\t\t\tonClick: () => {\n\t\t\t\t\t\tonOpen(node.id);\n\t\t\t\t\t},\n\t\t\t\t\tonContextMenu: (e) => {\n\t\t\t\t\t\te.preventDefault();\n\t\t\t\t\t\te.stopPropagation();\n\t\t\t\t\t\tif (row.blank) return;\n\t\t\t\t\t\tsetMenuRect({ left: e.clientX, top: e.clientY, right: e.clientX + 1, bottom: e.clientY + 1 });\n\t\t\t\t\t\tsetMenuOpen(true);\n\t\t\t\t\t},";
 
 // 2f. 会话行 Menu：锚点矩形统一走 getAnchorRect。
-const UI_SESSION_ANCHOR_ANCHOR = 'items: sessionMenuItems,\n\t\t\t\t\t\t\t\tonSelect: (id) => {';
-const UI_SESSION_ANCHOR_INSERT = 'items: sessionMenuItems,\n\t\t\t\t\t\t\t\tgetAnchorRect: () => menuRect,\n\t\t\t\t\t\t\t\tonSelect: (id) => {';
+const UI_SESSION_ANCHOR_ANCHOR = "\t\t\t\t\t\t\t\tportal: true,\n\t\t\t\t\t\t\t\tcloseOnPointerLeave: true,";
+const UI_SESSION_ANCHOR_INSERT = "\t\t\t\t\t\t\t\tportal: true,\n\t\t\t\t\t\t\t\tcloseOnPointerLeave: true,\n\t\t\t\t\t\t\t\tgetAnchorRect: () => menuRect,";
 
 // 2g. 会话行 ⋯ 按钮：点击时用按钮矩形做锚点。
-const UI_SESSION_BUTTON_ANCHOR = '"aria-label": t("actions.session.aria", { name: title }),\n\t\t\t\t\t\t\t\t\tonClick: (e) => {\n\t\t\t\t\t\t\t\t\t\te.stopPropagation();\n\t\t\t\t\t\t\t\t\t\tsetMenuOpen((v) => !v);\n\t\t\t\t\t\t\t\t\t},';
-const UI_SESSION_BUTTON_INSERT = '"aria-label": t("actions.session.aria", { name: title }),\n\t\t\t\t\t\t\t\t\tonClick: (e) => {\n\t\t\t\t\t\t\t\t\t\te.stopPropagation();\n\t\t\t\t\t\t\t\t\t\tsetMenuRect(e.currentTarget.getBoundingClientRect());\n\t\t\t\t\t\t\t\t\t\tsetMenuOpen((v) => !v);\n\t\t\t\t\t\t\t\t\t},';
+const UI_SESSION_BUTTON_ANCHOR = "\t\t\t\t\t\t\t\t\t\"aria-label\": t(\"actions.session.aria\", { name: title }),\n\t\t\t\t\t\t\t\t\tonClick: () => {\n\t\t\t\t\t\t\t\t\t\tsetMenuOpen((v) => !v);\n\t\t\t\t\t\t\t\t\t},";
+const UI_SESSION_BUTTON_INSERT = "\t\t\t\t\t\t\t\t\t\"aria-label\": t(\"actions.session.aria\", { name: title }),\n\t\t\t\t\t\t\t\t\tonClick: (e) => {\n\t\t\t\t\t\t\t\t\t\te.stopPropagation();\n\t\t\t\t\t\t\t\t\t\tsetMenuRect(e.currentTarget.getBoundingClientRect());\n\t\t\t\t\t\t\t\t\t\tsetMenuOpen((v) => !v);\n\t\t\t\t\t\t\t\t\t},";
 
-// 3a. 分组视图会话行调用点：传 group.cwd。
-const UI_GROUPED_CALL_ANCHOR = 'node,\n\t\t\t\t\t\t\t\t\t\t\tcurrentId: current,\n\t\t\t\t\t\t\t\t\t\t\tnow,';
-const UI_GROUPED_CALL_INSERT = 'node,\n\t\t\t\t\t\t\t\t\t\t\tcwd: group.cwd,\n\t\t\t\t\t\t\t\t\t\t\tcurrentId: current,\n\t\t\t\t\t\t\t\t\t\t\tnow,';
-
-// 3b. 扁平视图会话行调用点：从 list.byId 反查 cwd（孤儿会话为 undefined，项自动隐藏）。
-// 0.1.5-rc.1 重锚：currentId 改为 panelActive ? void 0 : list.current 三元形态。
-const UI_FLAT_CALL_ANCHOR = 'node,\n\t\t\t\t\t\t\tcurrentId: panelActive ? void 0 : list.current,\n\t\t\t\t\t\t\tnow,';
-const UI_FLAT_CALL_INSERT = 'node,\n\t\t\t\t\t\t\tcwd: list.byId[node.id]?.cwd,\n\t\t\t\t\t\t\tcurrentId: panelActive ? void 0 : list.current,\n\t\t\t\t\t\t\tnow,';
-
-// 4. 翻译：zh / en（与 menu.archiveSession 等同一字典）。
-const UI_ZH_ANCHOR = '"menu.archiveSession": "归档会话",\n\t\t\t"menu.deleteSession": "删除对话",';
-const UI_ZH_INSERT = '"menu.archiveSession": "归档会话",\n\t\t\t"menu.deleteSession": "删除对话",\n\t\t\t"menu.openProjectDir": "打开项目目录",';
-const UI_EN_ANCHOR = '"menu.archiveSession": "Archive session",\n\t\t\t"menu.deleteSession": "Delete conversation",';
-const UI_EN_INSERT = '"menu.archiveSession": "Archive session",\n\t\t\t"menu.deleteSession": "Delete conversation",\n\t\t\t"menu.openProjectDir": "Open project directory",';
+// 4. 翻译：zh / en（锚原生 menu.unarchiveSession 行，不与 session-manage 的
+// 注入体 chained——两者顺序无关，任一先跑都能命中）。
+const UI_ZH_ANCHOR = "\t\t\t\"menu.unarchiveSession\": \"取消归档\",";
+const UI_ZH_INSERT = "\t\t\t\"menu.openProjectDir\": \"打开项目目录\",\n\t\t\t\"menu.unarchiveSession\": \"取消归档\",";
+const UI_EN_ANCHOR = "\t\t\t\"menu.unarchiveSession\": \"Unarchive session\",";
+const UI_EN_INSERT = "\t\t\t\"menu.openProjectDir\": \"Open project directory\",\n\t\t\t\"menu.unarchiveSession\": \"Unarchive session\",";
 
 const UI_REPLACEMENTS = [
   { anchor: UI_PROJECT_ITEMS_ANCHOR, insert: UI_PROJECT_ITEMS_INSERT },
@@ -115,15 +111,13 @@ const UI_REPLACEMENTS = [
   { anchor: UI_PROJECT_STATE_ANCHOR, insert: UI_PROJECT_STATE_INSERT },
   { anchor: UI_PROJECT_ANCHOR_ANCHOR, insert: UI_PROJECT_ANCHOR_INSERT },
   { anchor: UI_PROJECT_BUTTON_ANCHOR, insert: UI_PROJECT_BUTTON_INSERT },
-  { anchor: UI_SESSION_SIG_ANCHOR, insert: UI_SESSION_SIG_INSERT },
   { anchor: UI_SESSION_STATE_ANCHOR, insert: UI_SESSION_STATE_INSERT },
-  { anchor: UI_SESSION_ITEMS_ANCHOR, insert: UI_SESSION_ITEMS_INSERT },
-  { anchor: UI_SESSION_SELECT_ANCHOR, insert: UI_SESSION_SELECT_INSERT },
+  { anchor: UI_SESSION_COMP_ANCHOR, insert: UI_SESSION_COMP_INSERT },
+  { anchor: UI_SESSION_INJECT_ANCHOR, insert: UI_SESSION_INJECT_INSERT },
+  { anchor: UI_SESSION_REG_ANCHOR, insert: UI_SESSION_REG_INSERT },
   { anchor: UI_SESSION_DIV_ANCHOR, insert: UI_SESSION_DIV_INSERT },
   { anchor: UI_SESSION_ANCHOR_ANCHOR, insert: UI_SESSION_ANCHOR_INSERT },
   { anchor: UI_SESSION_BUTTON_ANCHOR, insert: UI_SESSION_BUTTON_INSERT },
-  { anchor: UI_GROUPED_CALL_ANCHOR, insert: UI_GROUPED_CALL_INSERT },
-  { anchor: UI_FLAT_CALL_ANCHOR, insert: UI_FLAT_CALL_INSERT },
   { anchor: UI_ZH_ANCHOR, insert: UI_ZH_INSERT },
   { anchor: UI_EN_ANCHOR, insert: UI_EN_INSERT },
 ];
@@ -192,7 +186,7 @@ function buildUiFixture() {
   return UI_REPLACEMENTS.map((r) => r.anchor).join('\n// ---- 夹具分隔 ----\n') + '\n';
 }
 
-module.exports = { patchOpenProjectDir, MARKER, buildUiFixture };
+module.exports = { patchOpenProjectDir, MARKER, buildUiFixture, UI_REPLACEMENTS };
 
 if (require.main === module) {
   const root = process.argv[2] ? path.resolve(process.argv[2]) : path.resolve(__dirname, '..', 'node_modules');

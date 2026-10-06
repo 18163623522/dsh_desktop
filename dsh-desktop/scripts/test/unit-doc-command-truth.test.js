@@ -31,13 +31,10 @@ const dc = require('../lib/doc-commands');
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 
 /** 历史快照类文档的逐条豁免：改它们等于篡改历史记录，但必须留下可核对的理由。 */
-const HISTORY_EXEMPTIONS = [
-  {
-    file: 'docs/commit-plan-20260822.md',
-    script: 'test:unit',
-    reason: '带日期的提交计划快照（2026-08-22），记录当时的门禁写法；改写它等于篡改历史。',
-  },
-];
+// 清空记录（2026-10-05，v1.0.0 纯化）：唯一的豁免项 docs/commit-plan-20260822.md 是
+// 带日期的 0.6.x 提交计划快照，已随非桌面线内容一并移出仓库。本清单按上面的守卫规则
+// 必须与「磁盘上仍存在的历史文档」同步收缩——豁免留着不点名，就是清单在悄悄变松。
+const HISTORY_EXEMPTIONS = [];
 
 const sameFile = (a, b) => a.replace(/\\/g, '/') === b.replace(/\\/g, '/');
 

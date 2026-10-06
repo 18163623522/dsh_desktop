@@ -1,8 +1,8 @@
 {
-  "compatLayerVersion": "0.6.0-skeleton.1",
+  "compatLayerVersion": "1.0.0-rc.2.1",
   "kernel": {
-    "tag": "dsh-v0.1.6-alpha.1",
-    "packageVersion": "0.1.6-alpha.1",
+    "tag": "dsh-v0.2.0-rc.2",
+    "packageVersion": "0.2.0-rc.2",
     "acquisition": "offline-tarball",
     "vendorDir": "vendor/dsh-kernel",
     "upstream": "https://github.com/deepseek-ai/deepseek-harness",
@@ -20,8 +20,13 @@
       },
       {
         "id": "settings",
-        "module": "@deepseek-ai/dsh-settings-file",
+        "module": "@deepseek-ai/dsh-settings",
         "label": "设置文档"
+      },
+      {
+        "id": "config-editor",
+        "module": "@deepseek-ai/dsh-config-editor",
+        "label": "配置编辑器（settings 的前置服务）"
       },
       {
         "id": "llm",
@@ -83,7 +88,7 @@
       {
         "id": "api-gateway",
         "removedInKernel": "0.1.2-alpha.1",
-        "reason": "网关 folded 进核心原生实现（v0.5.7 健康页误报教训）"
+        "reason": "网关 folded 进核心原生实现（v0.5.7 健康页误报教训）。⚠ 本条说的是 ctx 服务 id：rc.2 全树 grep provide(\"api-gateway\") 零命中，但该 id 退役不等于包退役——@deepseek-ai/dsh-api-gateway 包仍在（rc.2 里它是 Remote event/stream 的校验库，不是服务提供者），我们的「历史续读补丁」照旧打在它的 lib/client.js 上。"
       },
       {
         "id": "code-runtime-python",
@@ -109,6 +114,36 @@
         "id": "e2b",
         "removedInKernel": "0.1.6-alpha.1",
         "reason": "E2B 云沙箱三件套（e2b/fs-e2b/subprocess-e2b）整体移除"
+      },
+      {
+        "id": "settings-file",
+        "removedInKernel": "0.2.0-rc.2",
+        "reason": "FileSettingsProvider 退役：settings 服务改由 dsh-settings 自己的 SettingsForms 直接 provide（super(ctx,\"settings\")，inject configEditor+profileContext）。dsh-api-settings-controller:479 的缺服务文案即权威指引「mount @deepseek-ai/dsh-settings with @deepseek-ai/dsh-config-editor in the profile composition」。旧包的 settings.yaml 落盘路径降级为一次性 legacy import（dsh-settings/README.zh L35）"
+      },
+      {
+        "id": "agent-presets",
+        "removedInKernel": "0.2.0-rc.2",
+        "reason": "复数包 dsh-agent-presets 拆为 dsh-agent-preset + dsh-agent-preset-registry（rc.2 家族零引用旧名）"
+      },
+      {
+        "id": "client-ui-settings-unarchive-sessions",
+        "removedInKernel": "0.2.0-rc.2",
+        "reason": "上游 rc.2 未再发布该页，全树零引用（含 README 都无 unarchive 字样）"
+      },
+      {
+        "id": "experimental-agent-team-web-profile",
+        "removedInKernel": "0.2.0-rc.2",
+        "reason": "并入 dsh-experimental-agent-team-profile——上游 README.zh L45 明确要求从 dsh.profile.bundles 删除该独立条目"
+      },
+      {
+        "id": "cordis-plugin-hmr",
+        "removedInKernel": "0.2.0-rc.2",
+        "reason": "收编进内核版本线：改名 @deepseek-ai/dsh-hmr，hmr 服务键与 baseDir/getLinked()/hmr/change 等 API 全保留（dsh-hmr/README.zh L36）"
+      },
+      {
+        "id": "cordis-plugin-logger-console",
+        "removedInKernel": "0.2.0-rc.2",
+        "reason": "上游 rc.2 未再发布；仅作为 dsh-session-telemetry-otel 的 devDependency 出现，运行期零引用"
       }
     ]
   },

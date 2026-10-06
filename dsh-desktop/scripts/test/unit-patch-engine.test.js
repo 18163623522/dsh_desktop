@@ -25,9 +25,9 @@ const {
   localCopyFiles, guardCopyFiles, localNodeModulesRoots,
   slotCompatCopyFiles, slotCompatPatchTargets,
   transformFlashFix,
-  SHELL_DESC_MARKER, SHELL_DESC_VALIDATE_OLD, SHELL_DESC_VALIDATE_NEW,
-  SHELL_DESC_SCHEMA_OLD, SHELL_DESC_SCHEMA_OPTIONAL, PW_REL, BASH_REL, transformShellDescriptionOptional,
-  RUNCODE_DESC_MARKER, RUNCODE_SCHEMA_OLD, RUNCODE_SCHEMA_OPTIONAL, RUNCODE_VALIDATE_OLD, RUNCODE_VALIDATE_NEW,
+  SHELL_DESC_MARKER, SHELL_DESC_SCHEMA_OLD, SHELL_DESC_SCHEMA_NEW,
+  SHELL_DESC_SCHEMA_OPTIONAL, PW_REL, BASH_REL, transformShellDescriptionOptional,
+  RUNCODE_DESC_MARKER, RUNCODE_SCHEMA_OLD, RUNCODE_SCHEMA_OPTIONAL,
   ATTACH_MIME_MARKER, ATTACH_MIME_OLD, ATTACH_MIME_NEW, ATTACH_LOCAL_REL, transformAttachmentMimeTrust,
   SLOT_KEY_COMPAT_PKG_REL, SLOT_UNKEYED_COMPAT_PKG_REL,
   SLOT_KEY_COMPAT_MARKER, SLOT_KEY_COMPAT_OLD, SLOT_KEY_COMPAT_NEW, transformLegacySlotKey,
@@ -35,6 +35,8 @@ const {
 } = require('../lib/runtime-patches');
 const { COMPANION_PLUGINS, companionDirName } = require('../lib/companion-plugins');
 const { DSHTOOLS_REL } = require('../lib/patch-target-resolver');
+// 变换类单测的起点一律取真 pristine 闭包树（详见 pristineShell 注释）。
+const { findPristineFile } = require('../lib/pristine-kernel-roots');
 const {
   PATCH_HEADER, ACP_DISABLE_BLOCK, PET_DISABLE_BLOCK,
   ACP_SELF_DISABLE_BLOCK, removeAcpBasicDisableBlock,
@@ -224,21 +226,24 @@ test('runtime-patches: 候选路径构造器（本地三副本/防护四副本/W
   ]);
 });
 
-// 把 dev node_modules 里可能已打过补丁的 shell 工具源还原为官方形态（validate +
-// schema 两处都回退），供变换单测从确定起点验证。
-function pristineShellSrc(live) {
-  let s = live;
-  if (s.includes(SHELL_DESC_VALIDATE_NEW)) s = s.replace(SHELL_DESC_VALIDATE_NEW, SHELL_DESC_VALIDATE_OLD);
-  if (s.includes(SHELL_DESC_SCHEMA_OPTIONAL)) s = s.replace(SHELL_DESC_SCHEMA_OPTIONAL, SHELL_DESC_SCHEMA_OLD);
-  return s;
+// 起点必须是真 pristine 字节（.tmp-kernel/.consumer-<pin> 闭包树），不是 dev
+// node_modules 的「反打还原」——还原函数只认识它自己那两处替换，内核里任何其它
+// 变化都会让还原产物与官方形态有差，测试于是验的是一个不存在的输入。
+function pristineShell(rel) {
+  const file = findPristineFile(rel);
+  assert.ok(file, `缺 pristine 源：@deepseek-ai/${rel}（先跑 node scripts/install-pristine-kernel.mjs）`);
+  return { file, src: fs.readFileSync(file, 'utf8') };
 }
 
-test('tool-compat: shell description 兜底变换（真实 vendored 文件 + 幂等）', () => {
+test('tool-compat: shell description 兜底变换（真 pristine 文件 + 幂等）', () => {
   for (const rel of [PW_REL, BASH_REL]) {
-    const file = path.join(repoRoot, 'node_modules', '@deepseek-ai', rel);
-    const src = pristineShellSrc(fs.readFileSync(file, 'utf8'));
+    const { file, src } = pristineShell(rel);
     const out = transformShellDescriptionOptional(src, file);
     assert.strictEqual(out.status, 'changed', rel + ' 应可补丁');
+    // 两半都必须上：schema 去 required + validate 缺省补值。只上一半就是
+    // 「changed 但静默失效」——引擎参数校验仍会先拒省略 description 的调用。
+    assert.match(out.note, /description 改为可选/, rel + ' 应命中 schema 半边');
+    assert.match(out.note, /validate 兜底/, rel + ' 应命中 validate 半边');
     assert.ok(out.src.includes(SHELL_DESC_MARKER), rel + ' 应写入幂等标记（validate 兜底）');
     assert.ok(out.src.includes(SHELL_DESC_SCHEMA_OPTIONAL), rel + ' description 应改为可选（删除 required: true 行）');
     assert.ok(!out.src.includes(SHELL_DESC_SCHEMA_OLD), rel + ' 不得残留 description 的 required: true 块');
@@ -250,16 +255,34 @@ test('tool-compat: shell description 兜底变换（真实 vendored 文件 + 幂
   }
 });
 
+test('tool-compat: run_code（dsh-tools）同构变换两半齐上且幂等', () => {
+  const { file, src } = pristineShell(DSHTOOLS_REL);
+  const out = transformShellDescriptionOptional(src, file);
+  assert.strictEqual(out.status, 'changed', 'dsh-tools run_code 应可补丁');
+  assert.match(out.note, /run_code: description 改为可选/, 'run_code schema 半边必须命中');
+  assert.match(out.note, /run_code: validate 兜底/, 'run_code validate 半边必须命中');
+  // 反证（作用域）：run_code 的三 tab validate 行以 shell 的一 tab 锚点为子串，
+  // 若 shell 半边在 dsh-tools 里也开火，会用 args.command 误改 run_code 行 ——
+  // 步骤顺序（run_code 先跑）就是这条的守卫。
+  assert.doesNotMatch(out.note, /shell:/, 'dsh-tools 不得被 shell 半边改写');
+  assert.ok(out.src.includes(RUNCODE_DESC_MARKER), '应写入 run_code 幂等标记');
+  assert.strictEqual(out.src.split(RUNCODE_SCHEMA_OLD).length - 1, 0, '两处 required:true 块都应消除');
+  assert.strictEqual(out.src.split(RUNCODE_SCHEMA_OPTIONAL).length - 1, 2, '两处 description 都应改为可选');
+  assert.ok(out.src.includes('args.description = args.code.trim().split'), '缺省 description 应从 code 首行生成');
+  assert.ok(out.src.includes('code: {' + '\n' + '\t\t\t\ttype: "string",' + '\n' + '\t\t\t\trequired: true'), 'code 仍须保持 required: true');
+  assert.deepStrictEqual(transformShellDescriptionOptional(out.src, file), { status: 'already' }, '二次应用应幂等');
+});
+
 test('tool-compat: shell description 历史误写（required: false）收敛为删除该行', () => {
-  const file = path.join(repoRoot, 'node_modules', '@deepseek-ai', PW_REL);
-  const src = pristineShellSrc(fs.readFileSync(file, 'utf8'));
-  const legacy = src.replace(
-    '\t\t\t\trequired: true,\n\t\t\t\tdescription: "Clear, concise description',
-    '\t\t\t\trequired: false, // dsh-desktop compat: optional shell description\n\t\t\t\tdescription: "Clear, concise description'
-  );
+  const { file, src } = pristineShell(PW_REL);
+  // 历史形态由常量拼出（与变换识别锚点同源），不再手抄字面量 —— 上一版手抄的
+  // 三 tab 字面量随 rc.2 缩进下沉一级后静默替换不上，assert 变成恒真的假绿。
+  const legacy = src.replace(SHELL_DESC_SCHEMA_OLD, SHELL_DESC_SCHEMA_NEW);
   assert.notStrictEqual(legacy, src, '应成功构造历史 required:false 形态');
+  assert.ok(legacy.includes(SHELL_DESC_SCHEMA_NEW), '构造出的历史形态应可被变换识别');
   const out = transformShellDescriptionOptional(legacy, file);
   assert.strictEqual(out.status, 'changed', '含历史 false 误写时应收敛为可选');
+  assert.match(out.note, /清理历史 required:false/, '应走历史误写收敛分支');
   assert.ok(!out.src.includes('required: false'), '收敛后不得残留 required: false');
   assert.ok(out.src.includes(SHELL_DESC_SCHEMA_OPTIONAL), '收敛后 description 应为可选形态');
   assert.ok(!out.src.includes(SHELL_DESC_SCHEMA_OLD), '收敛后不得残留 required: true 块');
@@ -272,22 +295,6 @@ test('tool-compat: shell description 锚点缺失时跳过且不改写', () => {
     status: 'anchor-missing',
     detail: '未找到 shell/run_code description 锚点（版本可能已变更），跳过 ' + file,
   });
-});
-
-test('tool-compat: run_code description 兜底变换（真实 dsh-tools + 双 schema 块 + 幂等）', () => {
-  const file = path.join(repoRoot, 'node_modules', '@deepseek-ai', DSHTOOLS_REL);
-  let src = fs.readFileSync(file, 'utf8');
-  // 还原官方形态（两处 required:true schema + 旧 trim 校验），从确定起点验证。
-  src = src.split(RUNCODE_SCHEMA_OPTIONAL).join(RUNCODE_SCHEMA_OLD);
-  src = src.split(RUNCODE_VALIDATE_NEW).join(RUNCODE_VALIDATE_OLD);
-  const out = transformShellDescriptionOptional(src, file);
-  assert.strictEqual(out.status, 'changed', 'dsh-tools run_code 应可补丁');
-  assert.ok(out.src.includes(RUNCODE_DESC_MARKER), '应写入 run_code 幂等标记');
-  assert.strictEqual(out.src.split(RUNCODE_SCHEMA_OLD).length - 1, 0, '两处 required:true 块都应消除');
-  assert.strictEqual(out.src.split(RUNCODE_SCHEMA_OPTIONAL).length - 1, 2, '两处 description 都应改为可选');
-  assert.ok(out.src.includes('args.description = args.code.trim().split'), '缺省 description 应从 code 首行生成');
-  assert.ok(out.src.includes('code: {' + '\n' + '\t\t\t\ttype: "string",' + '\n' + '\t\t\t\trequired: true'), 'code 仍须保持 required: true');
-  assert.deepStrictEqual(transformShellDescriptionOptional(out.src, file), { status: 'already' }, '二次应用应幂等');
 });
 
 test('tool-compat: attachment 图片字节信任变换（真实 vendored 文件 + 幂等）', () => {
@@ -579,8 +586,13 @@ test('companion-profile: 真实 assets 全量同步到隔离 profile（幂等零
     assert.ok(fs.existsSync(path.join(nm, p.name, 'package.json')), '包应落盘: ' + p.name);
   }
   // bundle 判定与 assets 源的可装配性一致（verify 相关文件会原样复制，因此对
-  // 源目录直接校验等价于对落盘副本校验；billion-context-dsh 上游缺 dist 构建
-  // 产物时必须按「源缺失」处理，不注册）。
+  // 源目录直接校验等价于对落盘副本校验）：任何「声明了 bundle 但源校验失败」的包
+  // 都必须按「源缺失」处理、不注册。
+  //
+  // 这里曾把包名写死成 billion-context-dsh（「上游缺 dist 构建产物」），后果是判据与
+  // 被测对象脱钩：真正失败的包换成 dsh-prompt-optimizer（package.json 声明
+  // ./dist/client.js 而实际只带 lib/index.js）时，`has('billion-context-dsh')` 照旧为
+  // false，测试全绿却什么都没守住。2026-10-05 实测记录。
   const declaredBundles = COMPANION_PLUGINS.filter((p) => {
     const pkg = JSON.parse(fs.readFileSync(path.join(assetsRoot, companionDirName(p), 'package.json'), 'utf8'));
     return bundlePatchRel(pkg) !== '';
@@ -592,8 +604,8 @@ test('companion-profile: 真实 assets 全量同步到隔离 profile（幂等零
   const expectedMissing = declaredBundles.filter((name) => !expectedBundles.includes(name));
   assert.deepStrictEqual([...r1.bundleNames].sort(), expectedBundles.sort(), 'bundleNames 应与源可装配性一致');
   assert.deepStrictEqual([...r1.missingNames].sort(), expectedMissing.sort(), '校验失败的 bundle 应计入缺失源');
-  if (expectedMissing.length > 0) {
-    assert.ok(!r1.bundleNames.has('billion-context-dsh'), '缺 dist 的 bundle 不得注册');
+  for (const name of expectedMissing) {
+    assert.ok(!r1.bundleNames.has(name), `源校验失败却仍被注册：${name}`);
   }
   // 记录全树 (path, size, mtimeMs)
   const snapshot = () => {

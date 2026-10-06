@@ -3,10 +3,11 @@
 // pi-ai-settings-heal 单元测试：settings.yaml 的 llm-pi-ai 非法供应商条目
 // 自愈（boot repair 步）。两条判定路径都覆盖：
 //   - 真内核路径：appDir 指向本仓 dsh-desktop，用安装根 @deepseek-ai/dsh-llm-pi-ai
-//     的真 apply() 判定（rc.1 仍 fail-loud 的标量校验形态，如 baseURL 空串；
+//     的真 apply() 判定（rc.1→rc.2 仍 fail-loud 的标量校验形态，如 baseURL 空串；
 //     alpha.5 的「目录外路由缺 api/baseURL」形态已被上游 deferred，另有哨兵测试）；
 //   - 注桩路径：inject.probeApply 覆盖判定，覆盖防环 / 放弃 / 多轮收敛等
-//     内核真码难以稳定构造的分支。
+//     内核真码难以稳定构造的分支。桩的入参形状必须与 rc.2 apply(ctx, config)
+//     一致（config.providers 是访问器），否则桩会在自造契约上通过。
 // 断言红线：绝不带着坏配置覆盖用户文件；零改动路径绝不写盘。
 
 const test = require('node:test');
@@ -26,11 +27,12 @@ function makeHome(yamlText) {
   return home;
 }
 
-/** 非法供应商（rc.1 真内核仍 fail-loud 的标量校验形态：baseURL 显式配成空串）。
+/** 非法供应商（rc.1/rc.2 真内核仍 fail-loud 的标量校验形态：baseURL 显式配成空串）。
  *  注：alpha.5 时代的「目录外路由缺 api/baseURL」形态在 rc.1 已被上游改为
  *  deferred 诊断（apply 走 resolveProfiles(providers, "deferred")，PiAiCatalogError
  *  收容进目录条目，不再击穿启动），见下方漂移哨兵测试；只有标量校验类错误
- *  仍让整段 apply 抛错（一家不合法、全体陪葬的崩溃面在 rc.1 仍然存在）。 */
+ *  仍让整段 apply 抛错（一家不合法、全体陪葬的崩溃面到 rc.2 仍然存在，
+ *  已由探针在 rc.2 字节上实测：空 baseURL 抛 provider "broken-relay" has an empty baseURL）。 */
 const BAD_PROVIDER = [
   '    broken-relay:',
   "      baseURL: ''",
@@ -70,8 +72,70 @@ function settingsWith(providersBody) {
 
 const NOOP_LOG = () => {};
 
+/** 取本仓安装根的 dsh-llm-pi-ai 真码（纯 ESM，只能动态 import）。 */
+function loadPiAi() {
+  const file = path.join(repoRoot, 'node_modules', '@deepseek-ai', 'dsh-llm-pi-ai', 'lib', 'index.js');
+  return import('node:url').then((u) => import(u.pathToFileURL(file).href));
+}
+
+/** rc.2 apply 用到的最小 ctx 依赖面（与 lib/probeWithKernel 同一形状）。 */
+function kernelShapedCtx() {
+  const noop = () => {};
+  return {
+    logger: { info: noop, warn: noop, error: noop, debug: noop },
+    inject: noop,
+    on: noop,
+    get: () => undefined,
+    fiber: {},
+    llm: new Proxy({}, { get: () => () => ({ replace: noop }) }),
+    authorization: { registerFlow: noop },
+  };
+}
+
 test('settingsFileOf 拼接 home 与 settings.yaml', () => {
   assert.equal(settingsFileOf('C:/x'), path.join('C:/x', 'settings.yaml'));
+});
+
+test('rc.2 契约哨兵：apply 仍按 (ctx, config) 取 config.providers.get() 与 ctx.fiber', () => {
+  // 自愈的判定完全依赖 mock 的 ctx/config 形状对上内核真码。上游再改一次访问器
+  // 形状时，本守卫当场变红；否则真机表现是 heal 静默报 unrecognized-failure
+  // （TypeError 里没有供应商名），用户的坏条目永远修不掉且没有任何信号。
+  const src = fs.readFileSync(
+    path.join(repoRoot, 'node_modules', '@deepseek-ai', 'dsh-llm-pi-ai', 'lib', 'index.js'), 'utf8');
+  assert.ok(src.includes('function apply(ctx, config)'), 'apply 入参形状漂移（第 2 参名 config）');
+  assert.ok(src.includes('config.providers.get()'), 'providers 仍是访问器（.get()）');
+  assert.ok(src.includes('ctx.fiber.entry?.options.id'), 'apply 首段仍读 ctx.fiber');
+  assert.ok(src.includes('ctx.on("internal/config"'), 'apply 仍注册 internal/config 监听（mock 需 ctx.on）');
+});
+
+test('反证：旧形状（providers 不是访问器）让真码抛出不含供应商名的 TypeError', async () => {
+  // 这正是修复前生产 probeWithKernel 的失败形态：note = unrecognized-failure:
+  // Cannot read properties of undefined (reading \'entry\')／config.providers.get is not a function。
+  const piAi = await loadPiAi();
+  let err;
+  try {
+    piAi.apply(kernelShapedCtx(), { providers: { 'broken-relay': { baseURL: '' } } });
+  } catch (e) { err = e; }
+  assert.ok(err, 'section 直喂（无 .get()）必须抛错');
+  assert.match(String(err.message), /config\.providers\.get is not a function/);
+  assert.equal(/provider "([^"]+)"/.exec(String(err.message)), null,
+    '消息里没有 provider "x" 形态 → 自愈无法定位条目，只能放弃');
+});
+
+test('真内核: probeWithKernel 对非法条目判 ok:false 并解析出供应商名，合法条目判 ok:true', async () => {
+  const piAi = await loadPiAi();
+  const bad = probeWithKernel(piAi.apply, {
+    providers: { 'broken-relay': { baseURL: '', models: [{ id: 'm', name: 'M', contextWindow: 1000, maxTokens: 100 }] } },
+  });
+  assert.equal(bad.ok, false, '空 baseURL 必须判为不健康');
+  assert.equal(bad.provider, 'broken-relay', '要能从错误消息解析出供应商键名（自愈靠它定位删除目标）');
+  assert.match(bad.message, /empty baseURL/);
+
+  const good = probeWithKernel(piAi.apply, {
+    providers: { 'good-relay': { api: 'openai-completions', baseURL: 'https://example.invalid/v1',
+      models: [{ id: 'm', name: 'M', contextWindow: 1000, maxTokens: 100 }] } },
+  });
+  assert.equal(good.ok, true, '合法条目应判健康: ' + JSON.stringify(good));
 });
 
 test('真内核: 非法供应商被移出，合法供应商与其它 section 原样保留，备份含原文', async () => {
@@ -98,7 +162,7 @@ test('真内核: 非法供应商被移出，合法供应商与其它 section 原
   const yaml = require(path.join(repoRoot, 'node_modules', 'yaml'));
   const doc = yaml.parseDocument(healed, { uniqueKeys: true });
   assert.equal(doc.errors.length, 0, '修复后应为合法 YAML');
-  const piAi = await import('node:url').then((u) => import(u.pathToFileURL(path.join(repoRoot, 'node_modules', '@deepseek-ai', 'dsh-llm-pi-ai', 'lib', 'index.js')).href));
+  const piAi = await loadPiAi();
   assert.equal(probeWithKernel(piAi.apply, doc.toJS()['llm-pi-ai']).ok, true, '修复后内核判定应通过');
 });
 
@@ -221,8 +285,9 @@ test('注桩: 多轮收敛——每轮抛一个非法条目，全部移出后通
   const r = await healPiAiSettings({
     appDir: repoRoot, home, log: NOOP_LOG,
     inject: {
-      probeApply: (ctx, section) => {
-        const keys = Object.keys((section && section.providers) || {});
+      // rc.2 契约：apply 的第二参是已解析配置，providers 是访问器（.get()）。
+      probeApply: (ctx, config) => {
+        const keys = Object.keys(config.providers.get());
         const hit = throwOrder.find((n) => keys.includes(n));
         if (hit) throw new Error('provider "' + hit + '" model "x" needs an api');
       },
@@ -266,8 +331,8 @@ test('注桩: 轮次耗尽仍不健康 → 终态复核放弃（绝不带坏配�
     appDir: repoRoot, home, log: NOOP_LOG,
     inject: {
       maxRounds: 1, // 轮 1 删 broken-relay 后即耗尽，终态复核 stub 仍炸 → 放弃
-      probeApply: (ctx, section) => {
-        const keys = Object.keys((section && section.providers) || {});
+      probeApply: (ctx, config) => {
+        const keys = Object.keys(config.providers.get());
         if (keys.length > 0) throw new Error('provider "' + keys[0] + '" bad');
         throw new Error('section-level boom');
       },

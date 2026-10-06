@@ -12,8 +12,7 @@
 //     关键词在位；minisign / check-agent-update 旧词不得回潮）+ 最新版本号一致；
 //  5. wsl-backend.md 契约键（settings 三键 / §2.1 载荷 / §2.2 返回 / env 覆盖）
 //     ↔ commands/wsl.rs + sidecar/wsl-mode.js，双向；
-//  6. docs/commit-plan-20260822.md §3 CHANGELOG 草案功能关键词 ↔ 测试文件存在（软断言）；
-//  7. bridge-api.md 55 方法表 ↔ bridge-shim.js dshDesktop 对象实际挂载方法名，双向。
+//  6. bridge-api.md 55 方法表 ↔ bridge-shim.js dshDesktop 对象实际挂载方法名，双向。
 //
 // 已知漂移以 KNOWN_* 白名单锁定（新漂移进 diff 即失败，消账后从白名单移除）。
 // 本文件只读仓库源码/文档，不做任何写操作。
@@ -43,7 +42,6 @@ const wslModeJs = read('dsh-tauri/sidecar/wsl-mode.js');
 const cliJs = read('dsh-tauri/sidecar/cli.js');
 const rootReadme = read('README.md');
 const tauriReadme = read('dsh-tauri/README.md');
-const commitPlan = read('docs/commit-plan-20260822.md');
 
 // ----------------------------------------------------------------------------
 // 通用小工具
@@ -360,40 +358,7 @@ test('TA7-5e wsl-backend.md §4.2 wslMode 布局旗标 ↔ sidecar 实装', () =
 });
 
 // ----------------------------------------------------------------------------
-// 6. commit-plan §3 CHANGELOG 草案 ↔ 测试文件存在（软断言）
-// ----------------------------------------------------------------------------
-
-test('TA7-6 commit-plan §3 草案功能关键词 ↔ 测试文件存在（软断言，缺失记警告）', () => {
-  const draft = section(commitPlan, '## 三、CHANGELOG 草案', '## 四、');
-  const features = [
-    { kw: ['会话完成通知', 'session-watch'], files: ['dsh-desktop/scripts/test/session-watcher.test.js', 'dsh-desktop/scripts/test/unit-session-watcher-cli.test.js'] },
-    { kw: ['余额', 'balance'], files: ['dsh-desktop/scripts/test/unit-balance.test.js', 'dsh-desktop/scripts/test/unit-balance-scheduler.test.js'] },
-    { kw: ['客户端更新链', 'sha256'], files: ['dsh-desktop/scripts/test/unit-github-release-assets.test.js', 'dsh-tauri/scripts/verify-update-sources.mjs'] },
-    { kw: ['WSL 托管后端'], files: ['dsh-desktop/scripts/test/unit-wsl-backend.test.js', 'dsh-tauri/sidecar/wsl-mode.test.js'] },
-    { kw: ['dsh-subagent-lens'], files: ['dsh-desktop/scripts/test/unit-dsh-subagent-lens.test.js'] },
-    { kw: ['better-sidebar'], files: ['dsh-desktop/scripts/test/unit-better-sidebar-chunk-retry.test.js'] },
-    { kw: ['file-drop'], files: ['dsh-desktop/scripts/test/unit-dsh-file-drop-attach.test.js'] },
-    { kw: ['设备授权'], files: ['dsh-desktop/scripts/test/unit-device-auth-guidance.test.js'] },
-  ];
-  let hit = 0;
-  const misses = [];
-  for (const f of features) {
-    assert.ok(f.kw.some((k) => draft.includes(k)), `草案缺关键词 ${f.kw}（草案内容漂移？）`);
-    const present = f.files.filter((file) => fs.existsSync(path.join(ROOT, file)));
-    if (present.length) hit += 1;
-    else misses.push(`${f.kw[0]} → 无任何对应文件`);
-    // 文件级缺口（软）：有兄弟测试兜底也记一笔，供漂移清单。
-    for (const file of f.files) {
-      if (!fs.existsSync(path.join(ROOT, file))) console.warn(`[TA7-6] 草案提及的文件缺失（软）: ${file}`);
-    }
-  }
-  // 软断言：≥80% 命中即绿；缺失项打印供漂移清单。
-  if (misses.length) console.warn('[TA7-6] 草案功能无对应测试文件（软断言）:\n  - ' + misses.join('\n  - '));
-  assert.ok(hit / features.length >= 0.8, `草案→测试覆盖率 ${(hit / features.length) * 100}% < 80%`);
-});
-
-// ----------------------------------------------------------------------------
-// 7. bridge-api.md 55 方法表 ↔ bridge-shim.js dshDesktop 挂载（双向）
+// 6. bridge-api.md 55 方法表 ↔ bridge-shim.js dshDesktop 挂载（双向）
 // ----------------------------------------------------------------------------
 
 function parseMdMethodSurfaces() {

@@ -234,18 +234,22 @@ function transformPersistenceTornTail(src, file) {
 // 时跳过该会话并告警，而不是让整个 plugin tree 初始化崩溃（2026-08 事故：
 // 卷影恢复带回零填充头部的会话日志，导致应用整体无法启动）。
 const PERSISTENCE_CORRUPT_MARKER = 'dsh-desktop-corrupt-guard-v1';
-// 0.1.5-rc.1 重锚：上游读 header 改为 readGenerationHeader(selected) 统一入口（含
-// ENOENT 单独分支），listArtifacts 的 catch 只放过 SessionFormatUnsupportedError。
-// 语义不变：读首行失败（损坏 zstd 等）告警跳过该会话，不击穿启动扫描。
+// 0.2.0-rc.2 重锚：上游在这一层原生白名单了两类可读错误——零填充头部走
+// readFirstZstdLine:3319 抛 SessionPersistenceCorruptionError，listArtifacts:3043
+// 直接 continue，故 2026-08 那起事故本身已被上游修掉。本补丁的**增量**是剩余的
+// 「不在白名单里的那一类」：readGenerationHeader 还会抛 plain Error
+// （assertNoRetiredHeaderFields、生成文件名与 header 版本不符 :3081、
+// assertStoredIdentity），单个坏文件仍会以 throw 掀掉整棵 plugin tree 初始化。
+// 语义照旧：读首行失败一律告警跳过该会话，不击穿启动扫描。
 const PERSISTENCE_CORRUPT_OLD =
-  '\t\t\t\t} catch (error) {\n\t\t\t\t\tif (error instanceof SessionFormatUnsupportedError) continue;\n\t\t\t\t\tthrow error;\n\t\t\t\t}';
+  '\t\t\t} catch (error) {\n\t\t\t\tif (error instanceof SessionFormatUnsupportedError || error instanceof SessionPersistenceCorruptionError) continue;\n\t\t\t\tthrow error;\n\t\t\t}';
 const PERSISTENCE_CORRUPT_NEW = [
-  '\t\t\t\t} catch (error) {',
-  '\t\t\t\t\tif (error instanceof SessionFormatUnsupportedError) continue;',
-  '\t\t\t\t\t// ' + PERSISTENCE_CORRUPT_MARKER + ': 损坏会话日志告警跳过，不得击穿启动扫描。',
-  '\t\t\t\t\tconsole.warn(`[dsh-session-persistence] skipping corrupt session log: ${selected.sourcePath} (${error?.message ?? error})`);',
-  '\t\t\t\t\tcontinue;',
-  '\t\t\t\t}',
+  '\t\t\t} catch (error) {',
+  '\t\t\t\tif (error instanceof SessionFormatUnsupportedError || error instanceof SessionPersistenceCorruptionError) continue;',
+  '\t\t\t\t// ' + PERSISTENCE_CORRUPT_MARKER + ': 损坏会话日志告警跳过，不得击穿启动扫描。',
+  '\t\t\t\tconsole.warn(`[dsh-session-persistence] skipping corrupt session log: ${selected.sourcePath} (${error?.message ?? error})`);',
+  '\t\t\t\tcontinue;',
+  '\t\t\t}',
 ].join('\n');
 
 function transformPersistenceCorruptGuard(src, file) {
@@ -514,11 +518,17 @@ function transformSlotErrorIsolation(src, file) {
 const SHELL_DESC_MARKER = "dsh-desktop compat: optional shell description";
 const SHELL_DESC_VALIDATE_OLD = "\tif (args.description.trim().length === 0) throw new Error(\"invalid description: expected a non-empty string\");";
 const SHELL_DESC_VALIDATE_NEW = "\tif (typeof args.description !== \"string\" || args.description.trim().length === 0) {\n\t\t// " + SHELL_DESC_MARKER + ": description is only for UI/log; derive one when the model omits it.\n\t\targs.description = args.command.trim().split(/\\r?\\n/)[0].slice(0, 80) || \"Run shell command\";\n\t}";
-const SHELL_DESC_SCHEMA_OLD = "\t\t\tdescription: {\n\t\t\t\ttype: \"string\",\n\t\t\t\trequired: true,\n\t\t\t\tdescription: \"Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples:";
+// 0.2.0-rc.2 起 shell 工具的 parameters 块整体下沉一级（defineTool 被包进工厂函数），
+// 于是 pwsh/bash 的 schema 从 3/4/4/4 tab 变成 4/5/5/4；validate 那行仍是 1 tab。
+// 若不同步重锚，本补丁会「changed 但只上了一半」——validate 兜底生效、schema 仍
+// required:true，模型省略 description 时被引擎参数校验先拒（正是本补丁要修的故障），
+// 而注册表与矩阵都只看得到 changed。回归位：unit-patch-engine 的 tool-compat 两例
+// 必须断言 note 同时含 schema 与 validate 两半。
+const SHELL_DESC_SCHEMA_OLD = "\t\t\t\tdescription: {\n\t\t\t\t\ttype: \"string\",\n\t\t\t\t\trequired: true,\n\t\t\t\t\tdescription: \"Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples:";
 // 目标形态：删除 description 的 `required: true` 行（省略 key = 可选）。
-const SHELL_DESC_SCHEMA_OPTIONAL = "\t\t\tdescription: {\n\t\t\t\ttype: \"string\",\n\t\t\t\tdescription: \"Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples:";
+const SHELL_DESC_SCHEMA_OPTIONAL = "\t\t\t\tdescription: {\n\t\t\t\t\ttype: \"string\",\n\t\t\t\t\tdescription: \"Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples:";
 // 历史误写形态（required: false，引擎定义期即拒）；仅作收敛识别锚点。
-const SHELL_DESC_SCHEMA_NEW = "\t\t\tdescription: {\n\t\t\t\ttype: \"string\",\n\t\t\t\trequired: false, // " + SHELL_DESC_MARKER + "\n\t\t\t\tdescription: \"Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples:";
+const SHELL_DESC_SCHEMA_NEW = "\t\t\t\tdescription: {\n\t\t\t\t\ttype: \"string\",\n\t\t\t\t\trequired: false, // " + SHELL_DESC_MARKER + "\n\t\t\t\t\tdescription: \"Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples:";
 
 // run_code（code 模式）description 兜底——与 shell 同构，落点在引擎包 dsh-tools：
 // schema description.required:true + execute 内 args.description.trim() 校验（3-tab）。

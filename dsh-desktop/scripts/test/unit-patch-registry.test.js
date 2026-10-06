@@ -88,35 +88,42 @@ test('所有 spec 的 marker 均引用共享常量（单一数据源，无内联
 
 test('防护类补丁与包级补丁均已登记（无遗漏 apply*）', () => {
   const ids = new Set(PATCH_SPECS.map((s) => s.id));
+  // rc.2 重靶后的登记面：settings-section-guard（register 调用点全内核 0 命中）、
+  // atomic-write-orphan-lock（上游原生 takeOverExitedLock）、model-image-input
+  // （上游原生 inputModalities）三条退役；profile-bundle-guard-profileboot 由
+  // profile-patch-layer-guard 取代（profile-boot-*.js 装配面消失，补丁层读取收口进
+  // dsh-app-boot 的 readProfilePatches）。
   const expected = [
     'slot-legacy-key', 'slot-unkeyed-compat', 'slot-error-isolation',
     'runtime-flash-fix', 'shell-description-compat',
     'attachment-mime-trust',
     'persistent-shell-abort-race', 'terminal-interrupt-escalation',
-    'profile-patch-guard', 'profile-bundle-guard-appboot', 'profile-bundle-guard-profileboot',
-    'settings-section-guard', 'plugin-inventory-tab-merge',
+    'profile-patch-guard', 'profile-bundle-guard-appboot', 'profile-patch-layer-guard',
+    'plugin-inventory-tab-merge',
     'web-search-baseurl', 'menu-viewport', 'open-project-dir',
     'session-persistence', 'tool-source-compat', 'pi-ai-opencode-go-models',
     'pi-ai-credits', 'pi-ai-reasoning-defaults', 'pi-ai-overflow-message',
-    'atomic-write-orphan-lock', 'settings-models-resilience',
+    'settings-models-resilience',
     'bundle-arrival-retry', 'agent-loop-scheduler-guard',
-    'empty-tool-name-guidance', 'model-image-input',
+    'empty-tool-name-guidance',
   ];
   for (const id of expected) assert.ok(ids.has(id), `遗漏补丁 ${id}`);
 });
 
-test('getSpecsByCli：返回 28 个 cli:true 补丁（8 runtime + 4 数据完整性 + 2 设置写入韧性 + 1 模型图片输入勾选 + 3 内核韧性 + 1 pi-ai 超限文案 + 2 本地二进制回落 + 1 skill 目录兼容 + 1 pi-ai 4xx 落盘 + 1 工作区标签闪跳 + 1 pi-ai Responses 工具名净化 + 1 pi-ai 工具名 wire 中央收口 + 1 pi-ai 配额耗尽不重试）', () => {
+test('getSpecsByCli：返回 26 个 cli:true 补丁（8 runtime + 4 数据完整性 + 1 设置写入韧性 + 3 内核韧性 + 1 pi-ai 超限文案 + 2 本地二进制回落 + 1 skill 目录兼容 + 1 pi-ai 4xx 落盘 + 1 工作区标签闪跳 + 3 pi-ai 工具名/配额系 + 1 空工具名指引 + 1 会话持久化 + 1 工具源兼容）', () => {
   const specs = getSpecsByCli();
-  assert.equal(specs.length, 28, 'cli 清单应恰为 28 项');
+  // 26 = 28（上一基线）− atomic-write-orphan-lock − model-image-input（rc.2 退役两条，
+  // 均 cli:true 规格）；guard 组与 image-send 系仍为 false，只在桌面壳运行时应用。
+  assert.equal(specs.length, 26, 'cli 清单应恰为 26 项');
   const expected = new Set([
     'slot-legacy-key', 'slot-unkeyed-compat', 'slot-error-isolation',
     'runtime-flash-fix', 'shell-description-compat',
     'attachment-mime-trust', 'session-persistence',
     'tool-source-compat', 'pi-ai-opencode-go-models', 'pi-ai-credits',
     'pi-ai-reasoning-defaults', 'pi-ai-overflow-message',
-    'atomic-write-orphan-lock', 'settings-models-resilience',
+    'settings-models-resilience',
     'bundle-arrival-retry', 'agent-loop-scheduler-guard',
-    'empty-tool-name-guidance', 'model-image-input',
+    'empty-tool-name-guidance',
     'codex-local-bin-fallback', 'claude-local-bin-fallback',
     'skill-dirs-compat',
     'workspace-chip-label-hold',
@@ -145,8 +152,8 @@ test('failPolicy：slot-error-isolation=degrade，其余=warn', () => {
 
 test('getSpecsByCli：每个 spec 的 transform/apply 与 patch-adapters 导出同源（无漂移）', () => {
   const adapters = require('../lib/patch-adapters');
-  // CLI 同步期的 8 个 file 补丁 transform + 1 个 root 补丁 apply，逐一与唯一
-  // 装配层（patch-adapters）导出严格同源，杜绝 registry 复制一份实现导致漂移。
+  // CLI 同步期涉及的 file 补丁 transform 与 root 补丁 apply，逐一与唯一装配层
+  // （patch-adapters）导出严格同源，杜绝 registry 复制一份实现导致漂移。
   const transformMap = {
     'slot-legacy-key': adapters.transformLegacySlotKey,
     'slot-unkeyed-compat': adapters.transformSlotUnkeyedCompat,
@@ -172,12 +179,10 @@ test('getSpecsByCli：每个 spec 的 transform/apply 与 patch-adapters 导出�
     'pi-ai-credits': adapters.rootAppliers.patchPiAiCredits,
     'pi-ai-reasoning-defaults': adapters.rootAppliers.patchPiAiReasoningDefaults,
     'pi-ai-overflow-message': adapters.rootAppliers.patchPiAiOverflowMessage,
-    'atomic-write-orphan-lock': adapters.rootAppliers.patchAtomicWriteOrphanLock,
     'settings-models-resilience': adapters.rootAppliers.patchSettingsModelsResilience,
     'bundle-arrival-retry': adapters.rootAppliers.patchBundleArrivalRetry,
     'agent-loop-scheduler-guard': adapters.rootAppliers.patchSchedulerGuard,
     'empty-tool-name-guidance': adapters.rootAppliers.patchEmptyToolName,
-    'model-image-input': adapters.rootAppliers.patchModelImageInput,
   };
   for (const spec of getSpecsByCli()) {
     if (spec.kind === 'root') {

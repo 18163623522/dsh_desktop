@@ -12,11 +12,12 @@
 //     auto——列表自身可滚动，任何视口高度下都完整可用；
 //  2. place() 的 y 夹紧按「封顶后的高度」计算，保证弹层始终完整落在视口内。
 //
-// 修复 issue #182（macOS 弹层横向溢出）：place() 的 x 夹紧带 `lw > 0` 前提——
-// 首帧列表未测量（lw=0，mac WebView 字体/布局时序更晚）时整段夹紧被跳过，
-// 弹层按锚点原始 x 溢出视口右缘被裁剪。修法：
-//  1. lw=0 时按视口宽兜底夹紧（不再放弃横向约束）；
-//  2. ResizeObserver 在列表尺寸变化时重新 place（首帧 0 → 变宽后自动校正）。
+// 修复 issue #182（macOS 弹层横向溢出）——【已退役，0.2.0-rc.2 重靶时判定】：
+// 原根因是 place() 只在挂载/scroll/resize 时跑，首帧 lw=0 跳过横向夹紧后再也
+// 不重算。rc.2 的 useLayoutEffect 自带逐帧重定位（`let frame =
+// requestAnimationFrame(track)`，track 里 place() + 续帧），锚点原始 x 溢出会在
+// 下一帧被夹紧修正；我们那份「lw=0 兜底夹紧 + ResizeObserver 重 place」对上游
+// 新形态零增量，且注入的 RO 与逐帧 track 重复。故整段删除（三处 #182 锚一并移除）。
 //
 // 用法：
 //   node scripts/patch-menu-viewport.js [<node_modules 根目录>]
@@ -29,59 +30,18 @@ const path = require('node:path');
 const { writeFileAtomic } = require('./lib/patch-io');
 
 const MARKER = 'dsh-desktop patch (issue #36)';
-const MARKER_182 = 'dsh-desktop patch (issue #182)';
 
-const OLD_Y_CLAMP = 'if (lh > 0) y = Math.min(Math.max(y, MARGIN), vh - lh - MARGIN);';
+// 0.2.0-rc.2 重锚：下界由字面量 MARGIN 改为 overlayTopMargin(MARGIN)
+// （内核新增的窗口顶缘避让——读 --dsh-frame-top-clearance，全屏时归零）。
+const OLD_Y_CLAMP = 'if (lh > 0) y = Math.min(Math.max(y, overlayTopMargin(MARGIN)), vh - lh - MARGIN);';
 const NEW_Y_CLAMP = [
   '// dsh-desktop patch (issue #36): 列表高度按视口封顶（见下方 maxHeight），',
   '// y 夹紧按封顶后的高度计算，弹层永远完整落在视口内。',
-  'if (lh > 0) y = Math.min(Math.max(y, MARGIN), Math.max(MARGIN, vh - Math.min(lh, vh - 2 * MARGIN) - MARGIN));',
+  'if (lh > 0) y = Math.min(Math.max(y, overlayTopMargin(MARGIN)), Math.max(MARGIN, vh - Math.min(lh, vh - 2 * MARGIN) - MARGIN));',
 ].join('\n');
 
 const OLD_STYLE = 'style: portal ? fixedPos ?? MEASURE_STYLE : void 0,';
 const NEW_STYLE = 'style: portal ? { ...(fixedPos ?? MEASURE_STYLE), maxHeight: "min(calc(100vh - 24px), 560px)", overflowY: "auto" } : void 0,';
-
-// issue #182：x 夹紧首帧兜底 + ResizeObserver 重定位。
-const X_CLAMP_36 = 'if (lw > 0) x = Math.min(Math.max(x, MARGIN), vw - lw - MARGIN);';
-const X_CLAMP_182 = [
-  '// dsh-desktop patch (issue #182): lw 未测量（首帧 0）时不得放弃横向夹紧——',
-  '// 按视口宽兜底；列表尺寸变化经 ResizeObserver 重新 place（mac WebView 首帧',
-  '// lw=0 时弹层按锚点原始 x 溢出视口右缘被裁剪的根因）。',
-  'if (lw > 0) x = Math.min(Math.max(x, MARGIN), vw - lw - MARGIN);',
-  'else x = Math.min(Math.max(x, MARGIN), Math.max(MARGIN, vw - 2 * MARGIN));',
-].join('\n');
-// 0.1.5-rc.1 重锚：primitives 该处缩进由 3 tab 收敛为 2 tab，锚点与注入体同步。
-const CLEANUP_182_ANCHOR = [
-  '\t\treturn () => {',
-  '\t\t\twindow.removeEventListener("scroll", place, true);',
-  '\t\t\twindow.removeEventListener("resize", place);',
-  '\t\t};',
-].join('\n');
-const CLEANUP_182_NEW = [
-  '\t\treturn () => {',
-  '\t\t\tro?.disconnect();',
-  '\t\t\twindow.removeEventListener("scroll", place, true);',
-  '\t\t\twindow.removeEventListener("resize", place);',
-  '\t\t};',
-].join('\n');
-const RO_CREATE_182_ANCHOR = [
-  '\t\tplace();',
-  '\t\twindow.addEventListener("scroll", place, true);',
-  '\t\twindow.addEventListener("resize", place);',
-].join(String.fromCharCode(10));
-// 注入落在 useLayoutEffect 体内（place 之外）——那里**没有** `listEl`：
-// `const listEl = listRef.current;` 是 place() 的局部量（alpha.5 与 rc.1 皆然）。
-// 早期注入体直接引用 listEl，浏览器里 ResizeObserver 存在 → && 短路到 listEl
-// 求值 → ReferenceError 击穿整个定位 effect（Menu 弹层反而完全不定位）。
-// effect 作用域内可用的是组件顶部的 `const listRef = useRef(null)`，故改走它。
-const RO_CREATE_182_NEW = [
-  '\t\tplace();',
-  '\t\twindow.addEventListener("scroll", place, true);',
-  '\t\twindow.addEventListener("resize", place);',
-  '\t\t// issue #182：列表首帧 lw=0、字体/内容撑宽后需要重新 place。',
-  '\t\tconst ro = typeof ResizeObserver !== "undefined" && listRef.current ? new ResizeObserver(() => place()) : null;',
-  '\t\tif (ro && listRef.current) ro.observe(listRef.current);',
-].join(String.fromCharCode(10));
 
 function patchFile(file, log = () => {}, stats, options) {
   let src;
@@ -91,45 +51,24 @@ function patchFile(file, log = () => {}, stats, options) {
     log('menu-viewport 补丁: 读取失败 ' + file + ': ' + err.message);
     return false;
   }
-  let changed36 = false;
-  let changed182 = false;
-  let applied = [];
-  if (!src.includes(MARKER)) {
-    if (!src.includes(OLD_Y_CLAMP) || !src.includes(OLD_STYLE)) {
-      log('menu-viewport 补丁: 锚点未匹配（dsh 版本可能已变化），跳过 ' + file);
-      if (stats) stats.anchorMissing += 1;
-    } else {
-      src = src.replace(OLD_Y_CLAMP, NEW_Y_CLAMP).replace(OLD_STYLE, NEW_STYLE);
-      src = '// ' + MARKER + ': Menu portal 列表视口封顶（issue #36）\n' + src;
-      changed36 = true;
-      applied.push('#36');
-    }
-  } else {
-    log('menu-viewport 补丁: #36 已应用，跳过 ' + file);
+  if (src.includes(MARKER)) {
+    log('menu-viewport 补丁: 已应用，跳过 ' + file);
+    return false;
   }
-  if (!src.includes(MARKER_182)) {
-    if (!src.includes(X_CLAMP_36) || !src.includes(CLEANUP_182_ANCHOR) || !src.includes(RO_CREATE_182_ANCHOR)) {
-      log('menu-viewport 补丁: #182 锚点未匹配（dsh 版本可能已变化），跳过 ' + file);
-      if (stats) stats.anchorMissing182 = (stats.anchorMissing182 || 0) + 1;
-    } else {
-      src = src.replace(X_CLAMP_36, X_CLAMP_182)
-        .replace(CLEANUP_182_ANCHOR, CLEANUP_182_NEW)
-        .replace(RO_CREATE_182_ANCHOR, RO_CREATE_182_NEW);
-      src = '// ' + MARKER_182 + ': Menu 弹层横向溢出修复（issue #182）\n' + src;
-      changed182 = true;
-      applied.push('#182');
-    }
-  } else {
-    log('menu-viewport 补丁: #182 已应用，跳过 ' + file);
+  if (!src.includes(OLD_Y_CLAMP) || !src.includes(OLD_STYLE)) {
+    log('menu-viewport 补丁: 锚点未匹配（dsh 版本可能已变化），跳过 ' + file);
+    if (stats) stats.anchorMissing += 1;
+    return false;
   }
-  if (!changed36 && !changed182) return false;
+  src = src.replace(OLD_Y_CLAMP, NEW_Y_CLAMP).replace(OLD_STYLE, NEW_STYLE);
+  src = '// ' + MARKER + ': Menu portal 列表视口封顶（issue #36）\n' + src;
   try {
     if (options && options.dryRun) {
-      log('menu-viewport 补丁: dry-run: 将应用 ' + file + '（' + applied.join(' + ') + '）');
+      log('menu-viewport 补丁: dry-run: 将应用 ' + file);
       return false; // dryRun 不落盘，不计为已写
     }
     writeFileAtomic(file, src);
-    log('menu-viewport 补丁: 已应用 ' + file + '（' + applied.join(' + ') + '）');
+    log('menu-viewport 补丁: 已应用 ' + file);
     return true;
   } catch (err) {
     log('menu-viewport 补丁: 写入失败 ' + file + ': ' + err.message);
@@ -138,7 +77,7 @@ function patchFile(file, log = () => {}, stats, options) {
 }
 
 /**
- * 对某个 node_modules 根目录应用补丁（#36 + #182，各自幂等）。
+ * 对某个 node_modules 根目录应用补丁（#36，幂等）。
  * @param {string} nmRoot node_modules 根目录
  * @param {(msg: string) => void} [log]
  * @returns {number} 实际发生修改的文件数
@@ -149,7 +88,7 @@ function patchMenuViewport(nmRoot, log = () => {}, stats, options) {
   return patchFile(file, log, stats, options) ? 1 : 0;
 }
 
-module.exports = { patchMenuViewport, MARKER, MARKER_182 };
+module.exports = { patchMenuViewport, MARKER };
 
 if (require.main === module) {
   const root = process.argv[2] ? path.resolve(process.argv[2]) : path.resolve(__dirname, '..', 'node_modules');

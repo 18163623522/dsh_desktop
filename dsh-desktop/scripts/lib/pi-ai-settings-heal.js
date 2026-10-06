@@ -9,6 +9,12 @@
 // 启动失败 → 设置页所有第三方供应商整组消失（数据仍在 settings.yaml，仅
 // UI 不可见）。「一家不合法，全体陪葬」。
 //
+// rc.2 现状：目录外路由的缺 api/baseURL 已被上游改为 deferred 诊断（坏路由可
+// 见但不击穿启动），本自愈因此不会去动它；仍然「一家不合法、全体陪葬」的是
+// **标量校验类**错误（空 baseURL / 空 displayName / 非法 header / 非法数值上限
+// / providers 仍是数组 / 已退役字段），它们让整段 apply 当场抛错。判定一律
+// 交给内核真码，本文件不复制任何规则。
+//
 // 修复：用安装内核的真码判定（mock ctx 跑 apply()，绝不自造目录内外规则
 // ——目录收录与否只有内核知道），把抛错 provider 逐个移出，循环直到 apply
 // 通过。宁漏勿误（对齐 removeDeadEntries「绝不自动删除、宁漏勿误」原则）：
@@ -20,9 +26,9 @@
 //   - 写入前先整文件备份（.heal-piai-<suffix>），备份失败则放弃写入；
 //   - 任何实现级异常由调用方容忍（repair 步语义：告警不阻断启动）。
 //
-// 已移出条目完整保留在备份文件，可人工回填：为该 provider 补
-// `api: openai-completions` + `baseURL: <端点>` 两行（或改用目录内已收录
-// 的路由名）即可恢复。
+// 已移出条目完整保留在备份文件，可人工回填：按备份条目对照内核报错修正
+// （空 baseURL 补成真实端点、非法数值上限改回正数、providers 数组改成 dict、
+// 已退役的 provider/maxRetries 字段删除），再写回 settings.yaml。
 // ---------------------------------------------------------------------------
 
 const fs = require('node:fs');
@@ -42,9 +48,14 @@ function settingsFileOf(home) {
 
 /**
  * 用安装内核真码判定一轮：mock ctx 喂 section 给 dsh-llm-pi-ai 的 apply()。
- * mock ctx 与内核插件的最小依赖面对齐（logger/inject/llm/authorization），
+ * mock ctx 与内核插件的最小依赖面对齐（logger/inject/on/get/fiber/llm/authorization），
  * llm 走 Proxy 兜住任意方法（directory.replace 等），不触真实文件系统。
- * @param {(ctx: unknown, section: unknown) => void} piAiApply 内核 apply
+ *
+ * 0.2.0-rc.2 起 apply 的第二个参数是**已解析配置**而非 section 本体——字段是访问器
+ * （`config.providers.get()` 取原始 providers dict），且函数体第一行就读
+ * `ctx.fiber.entry?.options.id`。两者缺一都会以 TypeError 形态抛错（不含 provider
+ * 名），自愈会误判成 unrecognized-failure 而整段放弃。
+ * @param {(ctx: unknown, config: unknown) => void} piAiApply 内核 apply
  * @param {unknown} section llm-pi-ai section（plain object）
  * @returns {{ok: true} | {ok: false, provider?: string, message: string}}
  *   ok=false 时 provider 为从错误消息解析出的供应商键名（解析不出则缺省）。
@@ -54,11 +65,15 @@ function probeWithKernel(piAiApply, section) {
   const ctx = {
     logger: { info: noop, warn: noop, error: noop, debug: noop },
     inject: noop,
+    on: noop,
+    get: () => undefined,
+    fiber: {}, // settingsNs 回落内核默认命名空间；entry 不存在时 apply 用 ?. 兜住
     llm: new Proxy({}, { get: () => () => ({ replace: noop }) }),
     authorization: { registerFlow: noop },
   };
+  const config = { providers: { get: () => (section && section.providers) || {} } };
   try {
-    piAiApply(ctx, section);
+    piAiApply(ctx, config);
     return { ok: true };
   } catch (err) {
     const message = String((err && err.message) || err);
@@ -148,7 +163,7 @@ async function healPiAiSettings({ appDir, home, log = () => {}, inject } = {}) {
       return result;
     }
     result.removed.push(name);
-    log('llm-pi-ai 自愈: 内核判定供应商条目不合法（目录外路由缺 api/baseURL），移出 ' + name);
+    log('llm-pi-ai 自愈: 内核判定供应商条目不合法（apply 当场抛错），移出 ' + name);
   }
 
   if (result.removed.length === 0) return result; // 本就健康，零写
@@ -188,7 +203,7 @@ async function healPiAiSettings({ appDir, home, log = () => {}, inject } = {}) {
   result.changed = true;
   result.backup = backup;
   log('llm-pi-ai 自愈完成: 移出 ' + result.removed.join(', ') + '，原文件已备份到 ' + backup
-    + '（回填方法：为该供应商补 api: openai-completions 与 baseURL 两行）');
+    + '（回填方法：按备份里的内核报错修正该供应商条目，再写回 settings.yaml）');
   return result;
 }
 

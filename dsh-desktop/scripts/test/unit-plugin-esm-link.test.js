@@ -182,16 +182,19 @@ test('插件具名导入必须都被内核实际导出（离线 ESM 链接，防
 //   · STRICT —— 线协议契约：内嵌副本版本必须等于 kernel-pin。dsh-hub 的 typert-protocol
 //     正是此类，rc.6 与 rc.1 的导出面已实际分叉。
 //   · SHAPE —— 工具契约：允许版本落后，但导出名集合必须与宿主同名包**全等**。
-//     better-sidebar 内嵌 dsh-tools@0.1.1-rc.1，实测 defineTool(options) 签名一致、
-//     23 项导出零增删 → 版本落后而形状兼容，故按形状锁而非按版本锁。
-// 不做全量强制：better-sidebar 还内嵌 15 份 0.1.1-rc.x 的 dsh-* 副本，全量比导出面会把
-// 一堆实际兼容的包一律判红，噪声淹掉真信号。新增跨界副本时必须在此登记并选档。
+// 不做全量强制：全量比导出面会把一堆实际兼容的包一律判红，噪声淹掉真信号。
+// 新增跨界副本时必须在此登记并选档。
+//
+// SHAPE 档当前为空（2026-10-05 撤销登记）。原条目登记的是 better-sidebar 内嵌
+// @deepseek-ai/dsh-tools —— 那份副本**从未入库**：better-sidebar 把整套 dsh-* 都列在
+// peerDependencies（由宿主供给），而且它不在 companion-plugins.js 的 shipsNodeModules
+// 名单内，所以伴随同步与 stage-payload 两条路都不会带上任何 node_modules。
+// 「登记项必须真实存在」这条清单防腐判据就是为这种情况准备的：盯着空气的守卫不是守卫，
+// 它只在装过依赖的开发机上偶然为真。
 const PROTOCOL_PARITY_STRICT = [
 	{ plugin: 'dsh-hub', pkg: '@deepseek-ai/dsh-typert-protocol' },
 ];
-const PROTOCOL_PARITY_SHAPE = [
-	{ plugin: 'dsh-better-sidebar', pkg: '@deepseek-ai/dsh-tools' },
-];
+const PROTOCOL_PARITY_SHAPE = [];
 
 function nestedPkgPath(plugin, pkg) {
 	return path.join(PLUGINS, plugin, 'node_modules', ...pkg.split('/'));

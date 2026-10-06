@@ -10,6 +10,14 @@
 #     resources/dsh-desktop/      ← package-payload（内核）
 #     resources/sidecar/  ui/     ← 同 resources 映射
 #
+# ⚠ 与真安装器有一处**故意保留**的差异：NSIS 的 resources 用
+#   `File /a "/oname=<映射名>"` 直落 `$INSTDIR`（扁平，实测 D:\app\DSH Desktop\
+#   dsh-desktop\），而这里放在 resources/ 下。别「对齐」成扁平——扁平布局会让
+#   dsh_cli.rs 的 install_root()（= exe 目录）命中，ensure_dsh_cli_shim 于是真的
+#   写 dsh.cmd 并把安装根**追加进用户 PATH（HKCU\Environment）**：冒烟不该动
+#   注册表。现形态下该自检以「内核/node 不在位（…\dsh-desktop\…）」告警跳过，
+#   既不影响 boot，也把 PATH 副作用隔在冒烟之外（真机的 shim 由安装器布局负责）。
+#
 # 环境隔离：DSH_HOME / DSH_TAURI_USERDATA 指向 $SMOKE 下临时目录
 # （Rust 与 Node 两侧同口径，见 shell-core paths.rs 生产覆盖通道）。
 #
@@ -25,7 +33,10 @@
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TARGET_DIR="$REPO_ROOT/dsh-tauri/src-tauri/target/x86_64-pc-windows-msvc/release"
+# 本机 gnu 线的产物在仓库外的 CARGO_TARGET_DIR 且三元组不同，硬编码 msvc 路径
+# 会「缺 release exe」直接退出——留 TARGET_DIR 覆盖通道（与 SMOKE_DIR 同风格），
+# 默认仍是 CI 的 msvc 布局。
+TARGET_DIR="${TARGET_DIR:-$REPO_ROOT/dsh-tauri/src-tauri/target/x86_64-pc-windows-msvc/release}"
 EXE="$TARGET_DIR/dsh-tauri-app.exe"
 SMOKE="${SMOKE_DIR:-/tmp/dsh-tauri-smoke}"
 
@@ -162,9 +173,12 @@ ok=""
 for i in $(seq 1 36); do
   sleep 5
   NEW=$(listening_pids | comm -13 <(echo "$PRE_PIDS") - | grep -c . )
+  # 建档判据用 profiles/web/package.json（profile 根的 bundles 清单，纯净线与插件线都会写）。
+  # 曾用 cordis.patch.yml——那是「随包插件声明 dsh.bundle.patch」才生成的文件，
+  # v1.0.0 纯净线 payload 不含内置插件（stage 有门禁），该文件恒不存在 → 冒烟恒红。
   if tasklist //FI "IMAGENAME eq dsh-tauri-app.exe" 2>/dev/null | grep -q dsh-tauri-app.exe \
      && [ "${NEW:-0}" -ge 2 ] \
-     && [ -f "$SMOKE/home/profiles/web/cordis.patch.yml" ]; then
+     && [ -f "$SMOKE/home/profiles/web/package.json" ]; then
     ok=1; echo "[smoke] ✓ 第 $((i*5))s：新增监听者=${NEW}（preview+内核）+ 隔离 profile 建立"; break
   fi
 done

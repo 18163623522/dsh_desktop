@@ -36,15 +36,18 @@ const { checkPatchClosure } = require('../lib/patch-closure');
 
 const { runDevTreePatch, buildDevCtx } = patchDeps;
 
-test('A：注册表全部 root 规格都在 patch-deps 默认覆盖集内（含历史漏接的 3 项）', () => {
+test('A：注册表全部 root 规格都在 patch-deps 默认覆盖集内（含历史漏接的 2 项）', () => {
   const rootIds = PATCH_SPECS.filter((s) => s.kind === 'root').map((s) => s.id);
-  assert.ok(rootIds.length >= 16, `root 规格应 ≥16，实际 ${rootIds.length}`);
+  // 15 = rc.2 重靶后的 root 规格数（atomic-write-orphan-lock / model-image-input 两条
+  // 随补丁退役从注册表与 rootAppliers 同时摘除）。
+  assert.equal(rootIds.length, 15, `root 规格应为 15，实际 ${rootIds.length}`);
   // 默认覆盖集 = getSpecsByGroup() 全量（root + file）；漏接防线：root 全在。
   const covered = new Set(PATCH_SPECS.map((s) => s.id));
   for (const id of rootIds) assert.ok(covered.has(id), `root 规格 ${id} 不在覆盖集`);
+  // 历史漏接项（当年 patch-deps 手写 remember 漏掉、重构为注册表驱动后必须由
+  // 结构保证覆盖）：atomic-write-orphan-lock 已随 rc.2 退役，此处换成同族存活项。
   for (const id of [
-    'pi-ai-overflow-message',
-    'atomic-write-orphan-lock', 'settings-models-resilience',
+    'pi-ai-overflow-message', 'settings-models-resilience', 'session-manage',
   ]) {
     assert.ok(covered.has(id), `历史漏接项 ${id} 必须被注册表驱动覆盖`);
   }
@@ -158,29 +161,35 @@ function extractPkg(tgz, pkgDir) {
 }
 
 test('D：临时树全链重放——落盘 / 幂等 / 锚点失配信号非零回流', () => {
-  const tgz = vendorTarball('dsh-atomic-write');
+  // 靶换成 dsh-client-ui-workspace + 两条同文件链式 root 补丁（open-project-dir 210
+  // → workspace-pin 215）：原用的 atomic-write-orphan-lock 已随 0.2.0-rc.2 退役，
+  // 而「两条 root 应用器在同一文件上串起来跑」恰好也是 rc.2 重锚后必须守住的形态。
+  const tgz = vendorTarball('dsh-client-ui-workspace');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pd-coverage-'));
   try {
     const nmRoot = path.join(root, 'node_modules');
-    const pkgDir = path.join(nmRoot, '@deepseek-ai', 'dsh-atomic-write');
+    const pkgDir = path.join(nmRoot, '@deepseek-ai', 'dsh-client-ui-workspace');
     extractPkg(tgz, pkgDir);
-    const target = path.join(pkgDir, 'lib', 'index.js');
-    assert.ok(fs.existsSync(target), 'pristine 提取应含 lib/index.js');
+    const target = path.join(pkgDir, 'lib', 'client.js');
+    assert.ok(fs.existsSync(target), 'pristine 提取应含 lib/client.js');
     const pristine = fs.readFileSync(target, 'utf8');
     assert.ok(!pristine.includes('dsh-desktop patch'), 'pristine 提取不得带干预');
 
     const logs = [];
     const log = (m) => logs.push(String(m));
-    const specs = PATCH_SPECS.filter((s) => s.id === 'atomic-write-orphan-lock');
+    const specs = PATCH_SPECS.filter((s) => s.id === 'open-project-dir' || s.id === 'workspace-pin');
+    assert.equal(specs.length, 2, '两条同靶 root 规格必须都在册');
 
-    // 首跑（真实写入临时树）：必须 changed>0 且零失配零失败。
+    // 首跑（真实写入临时树）：两条各写 1 文件 → changed=2，且零失配零失败。
     const r1 = runDevTreePatchFor(nmRoot, log, specs);
-    assert.ok(r1.changed > 0, `首跑应落盘，得 changed=${r1.changed}（logs: ${logs.join(' | ')}）`);
+    assert.equal(r1.changed, 2, `首跑应两条都落盘，得 changed=${r1.changed}（logs: ${logs.join(' | ')}）`);
     assert.equal(r1.anchorMissing, 0);
     assert.equal(r1.failed, 0);
     assert.deepEqual(r1.errors, []);
     const patched = fs.readFileSync(target, 'utf8');
-    assert.ok(patched.includes('dsh-desktop patch'), '落盘产物应含干预标记');
+    for (const marker of ['dsh-desktop patch (open project dir)', 'dsh-desktop patch (workspace pin)']) {
+      assert.ok(patched.includes(marker), `落盘产物应含 ${marker}`);
+    }
 
     // 重跑：幂等零写零失配。
     const r2 = runDevTreePatchFor(nmRoot, log, specs);
@@ -188,19 +197,31 @@ test('D：临时树全链重放——落盘 / 幂等 / 锚点失配信号非零�
     assert.equal(r2.anchorMissing, 0);
     assert.equal(r2.failed, 0);
 
-    // 篡改：还原 pristine 并挖掉锚点区 → 管线层必须收到非零 anchorMissing
-    // （fail-loud 回归位：静默消失在内核换代时被 npm ci / CI 当场暴露）。
-    const spec = specs[0];
-    const tampered = patched.replace(/dsh-desktop patch \([^)]+\)/g, 'untouched-upstream');
-    fs.writeFileSync(target, tampered, 'utf8');
-    const stats = { anchorMissing: 0, failed: 0 };
-    const n = spec.apply(nmRoot, log, stats, {});
-    assert.ok(!(n > 0) || stats.anchorMissing >= 0, 'applier 三态返回兼容');
-    // 直接调 runDevTreePatch 全链语义：被篡改 spec 计失配或重写成功（两者
-    // 都对——重写成功说明锚点仍在原位；关键是任何失败都进 report 可见）。
+    // 篡改一（等价于 npm ci 把靶重置回 pristine）：全链必须重放落盘——换代后
+    // 「静默消失」要么被恢复、要么以失配可见，绝不允许零动作。
+    fs.writeFileSync(target, pristine, 'utf8');
     const r3 = runDevTreePatchFor(nmRoot, log, specs);
-    assert.ok(r3.changed + r3.anchorMissing + r3.failed + r3.errors.length > 0,
-      '篡改后重跑不得全零（干预要么恢复要么失配可见）');
+    assert.equal(r3.changed, 2, '还原 pristine 后重跑必须两条都重放');
+    assert.equal(r3.anchorMissing, 0);
+
+    // 篡改一b（逐规格幂等）：链头已在位时，全链只补链尾那一条（不重复装配）。
+    fs.writeFileSync(target, pristine, 'utf8');
+    assert.equal(runDevTreePatchFor(nmRoot, log, specs.slice(0, 1)).changed, 1, '链头单独应用应写 1 文件');
+    const r4 = runDevTreePatchFor(nmRoot, log, specs);
+    assert.equal(r4.changed, 1, '链头已在位时只应补链尾一条');
+
+    // 篡改二（fail-loud 回归位）：还原 pristine 并挖掉 open-project-dir 的首个锚点 →
+    // 管线层必须收到非零 anchorMissing（静默消失在内核换代时被 npm ci / CI 当场暴露）。
+    // 这里点名断言计数，而不是像旧版那样写一条恒成立的 `!(n>0) || stats.anchorMissing>=0`。
+    const { UI_REPLACEMENTS } = require('../patch-open-project-dir');
+    fs.writeFileSync(target, pristine.replace(UI_REPLACEMENTS[0].anchor, '/* TA6-ANCHOR-REMOVED */'), 'utf8');
+    const stats = { anchorMissing: 0, failed: 0 };
+    const n = specs[0].apply(nmRoot, log, stats, {});
+    assert.equal(n, 0, '锚点被挖掉后不得半写落盘');
+    assert.equal(stats.anchorMissing, 1, '锚点失配必须回流 1 次（applyReplacements 首失即止）');
+    assert.equal(stats.failed, 0);
+    assert.ok(!fs.readFileSync(target, 'utf8').includes('dsh-desktop patch'),
+      '失配路径不得留下任何干预');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -240,7 +261,7 @@ function runDevTreePatchFor(nmRoot, log, specs) {
 // 判据取 transform 的 status 而非 marker 文本：'changed' 恰好等价于「磁盘字节比
 // 代码旧」，而 marker 判定会被多版本变体（v1/v2 marker 不同名）误伤。
 //
-// 局限（诚实记录，别假装有覆盖）：kind:'root' 的 17 项用同样方式核不了 —— 它们
+// 局限（诚实记录，别假装有覆盖）：kind:'root' 的 15 项用同样方式核不了 —— 它们
 // 没有 pkgRel，靶文件只有 spec.apply 知道；而 apply 是写盘动作，dryRun 支持属于
 // 各模块自觉而非契约。root 型仍由 A（结构全集）+ 各自单测的 dry-run 用例兜。
 // ---------------------------------------------------------------------------

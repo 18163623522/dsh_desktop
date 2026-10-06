@@ -19,15 +19,18 @@ const path = require('node:path');
 
 const PIN_REL = path.join('scripts', 'compat', 'kernel-pin.json');
 
-// 0.1.6 起收编族（cordis/cosmokit/schemastery/node-addon-system，含平台子包）被
-// 内核收编后版本线与 kernel pin 不同（见 install-kernel.mjs 头注释）——按文件名
-// 前缀豁免精确版本比对，否则完整 vendor 反被判「版本混装」fail-closed 拒启
+// 收编族 / 版本线独立族（cordis/cosmokit/schemastery/node-addon-system/libreoffice-kit，
+// 含平台子包）被内核收编后版本线与 kernel pin 不同（见 install-kernel.mjs 头注释）——
+// 按文件名前缀豁免精确版本比对，否则完整 vendor 反被判「版本混装」fail-closed 拒启
 // （0.6.5 实测：14 个收编族 tarball 被旧自愈误隔离后 validate 才「假绿」）。
+// 0.2.0-rc.2 起新增 @deepseek-ai/libreoffice-kit（dsh-skill-office / dsh-office-to-pdf
+// 的 LibreOffice 引擎载体，自有 0.1.x 版本线）。
 const REHOMED_PREFIXES = [
   'deepseek-ai-cordis',
   'deepseek-ai-cosmokit',
   'deepseek-ai-schemastery',
   'deepseek-ai-node-addon-system',
+  'deepseek-ai-libreoffice-kit',
 ];
 
 /** 收编族 tarball（版本线独立于 kernel pin，仅需与自身 manifest 自洽）。 */

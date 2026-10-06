@@ -92,7 +92,10 @@ function fixture() {
     type: 'turn/start',
     seq: 0,
     time: 1,
-    data: { turn: 0 },
+    // rc.2 的 V4 关系折叠器从 turn 1 起算（nextTurn = 1），turn/start 的
+    // data.turn 必须等于它，否则 assertV4RowAdmission 先抛
+    // 「turn/start does not open the expected turn」，被测的撕裂恢复路径根本到不了。
+    data: { turn: 1 },
   };
   const headerFrame = frame(JSON.stringify(header) + '\n');
   return {
@@ -137,7 +140,7 @@ test('complete newline-terminated frame keeps the normal no-marker path', async 
     type: 'turn/end',
     seq: 1,
     time: 2,
-    data: { turn: 0, reason: { kind: 'completed' } },
+    data: { turn: 1, reason: { kind: 'completed' } },
   };
 
   const result = await backend.readZstdPrefix(Buffer.concat([
@@ -163,7 +166,7 @@ test('torn JSONL in a non-final complete frame remains corruption', async (t) =>
     type: 'turn/end',
     seq: 1,
     time: 2,
-    data: { turn: 0, reason: { kind: 'completed' } },
+    data: { turn: 1, reason: { kind: 'completed' } },
   }) + '\n');
 
   const warns = [];

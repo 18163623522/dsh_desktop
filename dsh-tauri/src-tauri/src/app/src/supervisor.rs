@@ -2394,9 +2394,17 @@ Content-Length: 0
         std::env::set_var("DSH_HOME", &home);
         std::env::set_var("DSH_TAURI_USERDATA", home.join("ud"));
         let sv: Arc<Supervisor> = Arc::new(Supervisor::new(&root));
-        // 版本断言放宽到 0.1.x：内核家族从 0.1.0-rc.8 升到 0.1.1-rc.1（K1 适配），
-        // 前缀 0.1. 覆盖两者，防止每次 rc 平移都要改这里。
-        assert!(sv.kernel_version.starts_with("0.1."), "内核版本应可读: {}", sv.kernel_version);
+        // 版本断言以 pin 为唯一事实源（dsh-desktop/scripts/compat/kernel-pin.json 的
+        // kernel.packageVersion）。曾写死前缀 "0.1."（当时为覆盖 rc.8→rc.1 平移），
+        // 内核跨到 0.2.0-rc.2 后它以「错误的理由」变红：这里要验的是「payload 版本
+        // == pin」这条契约，不是某个具体大版本号。
+        let pin_path = root.join("dsh-desktop").join("scripts").join("compat").join("kernel-pin.json");
+        let pin_raw = std::fs::read_to_string(&pin_path)
+            .unwrap_or_else(|e| panic!("kernel-pin.json 应可读（{}）: {e}", pin_path.display()));
+        let pin: serde_json::Value = serde_json::from_str(&pin_raw).expect("kernel-pin.json 应为合法 JSON");
+        let want = pin["kernel"]["packageVersion"].as_str().unwrap_or("").to_string();
+        assert!(!want.is_empty(), "pin 读不到 kernel.packageVersion: {pin_raw}");
+        assert_eq!(sv.kernel_version, want, "payload 内核版本应等于 pin");
         let (tx, rx) = std::sync::mpsc::channel();
         sv.spawn_boot(tx, None);
         // boot（~4s）+ 内核就绪（~6s），150s 兜底；先到的 BootStep 逐条核对。

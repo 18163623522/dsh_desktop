@@ -105,6 +105,58 @@ test('锚点缺失：整文件跳过、绝不落盘半截', () => {
   }
 });
 
+// 逐锚点反证：11 个锚任意缺一个都必须「整文件跳过 + 字节级不变 + anchorMissing=1」。
+// 只测「锚都在位时补丁成功」是假绿的一半来源——rc.2 换代时 UI_HOOKS 的 menuRect
+// 锚、UI_ZH/EN 的 menu.openProjectDir 锚（那是 open-project-dir 自己的产物，不是
+// 原生字节）就是这样被这条测出来必须重锚的。
+test('逐锚点反证：任一锚缺失都必须整文件跳过且不落盘', (t) => {
+  const full = buildUiFixture();
+  UI_REPLACEMENTS.forEach((r, i) => {
+    const broken = full.replace(r.anchor, '/* ANCHOR-GONE */');
+    assert.notStrictEqual(broken, full, `夹具里找不到锚 #${i}: ${r.anchor.slice(0, 40)}`);
+    const sb = makeSandbox();
+    try {
+      fs.writeFileSync(sb.file, broken, 'utf8');
+      const stats = { anchorMissing: 0, failed: 0 };
+      const n = patchWorkspacePin(sb.dir, () => {}, stats);
+      assert.strictEqual(n, 0, `锚 #${i} 缺失时不得计入 changed`);
+      assert.strictEqual(stats.anchorMissing, 1, `锚 #${i} 缺失应计 anchorMissing=1`);
+      assert.strictEqual(fs.readFileSync(sb.file, 'utf8'), broken, `锚 #${i} 缺失时文件字节级不变`);
+    } finally {
+      fs.rmSync(sb.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// 锚点必须互不嵌套：夹具是锚点顺序拼接，某锚若在另一锚体内再出现，real bundle 上
+// 的 String.replace 就可能打到错误的那一处（置顶接线打进了兄弟函数）。
+test('锚点唯一性：夹具中每个锚恰好命中一次', () => {
+  const fx = buildUiFixture();
+  UI_REPLACEMENTS.forEach((r, i) => {
+    const hits = fx.split(r.anchor).length - 1;
+    assert.strictEqual(hits, 1, `锚 #${i} 应命中 1 次，实为 ${hits}：${r.anchor.slice(0, 50)}`);
+  });
+});
+
+// 链式安全：insert 默认原样保留自己的锚，这样共享同一原生锚的补丁（open-project-dir）
+// 无论谁先跑都能命中；确实改写原生字节的须显式登记。
+const MUTATES = [
+  'const workspaceMenuItems = [{',                 // rename 前插 pin 项
+  'className: clsx(Rows_module_css_default.slot',  // folder 图标着色（插 style 行）
+  'className: Rows_module_css_default.projectText',// 标题前小圆点（jsx→jsxs）
+  'return groups;',                               // 分组产出改走置顶重排
+  'statuses,',                                    // deps 尾项追加版本号
+];
+test('链式安全：insert 保留锚，改写原生字节的须进 MUTATES 豁免表', () => {
+  UI_REPLACEMENTS.forEach((r, i) => {
+    if (r.insert.includes(r.anchor)) return;
+    assert.ok(
+      MUTATES.some((head) => r.anchor.includes(head)),
+      `锚 #${i} 的 insert 未保留锚，也未登记为改写型：${r.anchor.slice(0, 60)}`
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 2. 核心行为（CORE 与注入同源）
 // ---------------------------------------------------------------------------

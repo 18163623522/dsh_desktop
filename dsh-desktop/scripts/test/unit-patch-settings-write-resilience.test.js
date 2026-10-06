@@ -2,10 +2,13 @@
 
 // patch-settings-write-resilience 补丁单元测试（node --test）。
 //
-// v0.5.2「模型设置页添加供应商没反应/按钮灰」两层根治的行为学验证：
-//   · 孤儿锁自愈（dsh-atomic-write）：transform 锚点/幂等/语法 + 真产物行为
-//     （vm 实跑 patched withFileLock——死 PID 锁被清并放行、活 PID 锁保持
-//     上游超时语义、非数字锁体按存活处理、操作完成后锁照常释放）；
+// v0.5.2「模型设置页添加供应商没反应/按钮灰」两层根治的行为学验证。
+//
+// 0.2.0-rc.2 起只剩设置页半边：孤儿锁自愈（dsh-atomic-write）已退役——上游
+// withFileLock 自己长出了 takeOverExitedLock（lib/index.js 里 process.kill(pid, 0)
+// 判活 + 接管退出持有者），我们的 transform 对 rc.2 pristine 字节返回 anchor-missing；
+// 注册表规格与 rootAppliers 接线已摘，transform 实现留在原文件休眠。故本文件
+// 不再引用 AW_FILE 与孤儿锁相关导出（2026-10-05 收口）。
 //   · 设置页韧性（dsh-client-ui-settings-models）：transform 锚点/幂等/语法
 //     + 注入片段行为（provider 目录与镜像视图偏差时强制重读并重建 namespaces、
 //     无偏差时不重读；settings-conflict 时重读 revision 静默重试一次、重试
@@ -16,50 +19,42 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const vm = require('node:vm');
 const { spawnSync } = require('node:child_process');
 
 const {
-  ORPHAN_LOCK_MARKER,
   NAMESPACE_HEAL_MARKER,
   CONFLICT_RETRY_MARKER,
-  transformOrphanLock,
   transformSettingsModelsResilience,
-  patchAtomicWriteOrphanLock,
   patchSettingsModelsResilience,
   AW_CONSTANTS,
 } = require('../lib/patch-settings-write-resilience');
 const { kernel } = require('../compat/kernel-pin.json');
 
-// payload pristine 源（stage-payload 镜像；boot 链跑过后可能已带补丁——幂等
-// 场景反而覆盖 already 分支，行为测试统一在临时目录自建 pristine 夹具）。
-// 0.1.2-alpha.2 重靶期：dsh-client-ui-settings-models 半边改用 vendored tarball
-// 解包的 pristine 源（payload 树停留在 alpha.1，锚点已换代；原子写半边
-// 锚点未漂移，维持 payload 源）。tarball 随 kernel-pin 换版（alpha.3 起）。
+// pristine 源取 vendored tarball 解包字节（随 kernel-pin 换版自动跟随）。
+// 0.1.2-alpha.2 重靶期把它从 payload 换成 tarball（payload 树停留在 alpha.1，锚点
+// 已换代）—— 当时指向 payload 等于把 dsh-tauri/package-payload 变成单测的硬前置：
+// payload 不暂存即 ENOENT 全红，而 payload 又是打包链就地打补丁的目录（不是真
+// pristine）。2026-10-05 收口。
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
-const PAYLOAD_NM = path.join(
-  REPO_ROOT, 'dsh-tauri', 'package-payload', 'dsh-desktop', 'node_modules', '@deepseek-ai'
-);
-const AW_FILE = path.join(PAYLOAD_NM, 'dsh-atomic-write', 'lib', 'index.js');
-const SM_VENDOR_TARBALL = path.join(
-  REPO_ROOT, 'dsh-desktop', 'vendor', 'dsh-kernel',
-  `deepseek-ai-dsh-client-ui-settings-models-${kernel.packageVersion}.tgz`,
-);
-const SM_FILE = extractPristineSettingsModels();
+const SM_FILE = extractPristineFile('dsh-client-ui-settings-models', 'lib/client.js');
 
-/** 把 vendored tarball 解到一次性目录，返回 pristine client.js 路径。 */
-function extractPristineSettingsModels() {
+/** 把某个内核包的 vendored tarball 解到一次性目录，返回包内文件的绝对路径。 */
+function extractPristineFile(pkg, rel) {
   const { after } = require('node:test');
-  assert.ok(fs.existsSync(SM_VENDOR_TARBALL), '缺 vendored alpha.3 tarball: ' + SM_VENDOR_TARBALL);
+  const tarball = path.join(
+    REPO_ROOT, 'dsh-desktop', 'vendor', 'dsh-kernel',
+    `deepseek-ai-${pkg}-${kernel.packageVersion}.tgz`,
+  );
+  assert.ok(fs.existsSync(tarball), `缺 vendored ${kernel.packageVersion} tarball: ${tarball}`);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-swr-pristine-'));
   after(() => fs.rmSync(dir, { recursive: true, force: true }));
   // win32 显式用系统自带 bsdtar（Git Bash 的 GNU tar 会把 "C:\" 当远程主机）。
   const tarBin = process.platform === 'win32'
     ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
     : 'tar';
-  const res = spawnSync(tarBin, ['-xzf', SM_VENDOR_TARBALL, '-C', dir], { encoding: 'utf8' });
+  const res = spawnSync(tarBin, ['-xzf', tarball, '-C', dir], { encoding: 'utf8' });
   assert.equal(res.status, 0, 'tar 解包失败: ' + (res.stderr || ''));
-  return path.join(dir, 'package', 'lib', 'client.js');
+  return path.join(dir, 'package', ...rel.split('/'));
 }
 
 function readOrSkip(file) {
@@ -87,130 +82,6 @@ function assertSyntaxOk(source, label) {
     fs.rmSync(tmp, { force: true });
   }
 }
-
-// ---------------------------------------------------------------------------
-// 孤儿锁自愈：transform 层
-// ---------------------------------------------------------------------------
-
-test('orphan-lock: transform 命中锚点产出 changed 且语法合法', () => {
-  const src = readOrSkip(AW_FILE);
-  assert.ok(src !== null, 'payload 缺 dsh-atomic-write/lib/index.js');
-  const r = transformOrphanLock(src, 'aw');
-  assert.ok(r.status === 'changed' || r.status === 'already', `期望 changed/already，实际 ${r.status}`);
-  if (r.status === 'changed') {
-    assert.ok(r.src.includes(ORPHAN_LOCK_MARKER));
-    assert.ok(r.src.includes('isDshOrphanLock'));
-    assertSyntaxOk(r.src, 'atomic-write');
-  }
-});
-
-test('orphan-lock: 幂等（二遍 already）', () => {
-  const src = readOrSkip(AW_FILE);
-  assert.ok(src !== null);
-  const r1 = transformOrphanLock(src, 'aw');
-  if (r1.status !== 'changed') return; // payload 已带补丁，already 分支即幂等证据
-  const r2 = transformOrphanLock(r1.src, 'aw');
-  assert.equal(r2.status, 'already');
-});
-
-test('orphan-lock: 无锚点时 anchor-missing 不改写', () => {
-  const r = transformOrphanLock('export {};', 'aw');
-  assert.equal(r.status, 'anchor-missing');
-});
-
-test('orphan-lock: root 应用器在临时 nm 根实跑（changed → already）', () => {
-  const src = readOrSkip(AW_FILE);
-  assert.ok(src !== null);
-  const pristine = src.includes(ORPHAN_LOCK_MARKER)
-    ? transformStripOrphan(src)
-    : src;
-  const root = makeNmRoot(path.join('dsh-atomic-write', 'lib', 'index.js'), pristine);
-  try {
-    const n1 = patchAtomicWriteOrphanLock(root, () => {});
-    const n2 = patchAtomicWriteOrphanLock(root, () => {});
-    assert.equal(n1, 1);
-    assert.equal(n2, 0);
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-/** 从已打补丁的源剥掉注入（构造 pristine 夹具用）：与 transform 同源的注入常量反向替换。 */
-function transformStripOrphan(src) {
-  let s = src;
-  s = s.split(AW_CONSTANTS.HELPER_INJECTION).join(AW_CONSTANTS.HELPER_ANCHOR);
-  s = s.split(AW_CONSTANTS.CONTENTION_NEW).join(AW_CONSTANTS.CONTENTION_ANCHOR);
-  s = s.split(AW_CONSTANTS.IMPORT_NEW).join(AW_CONSTANTS.IMPORT_ANCHOR);
-  return s;
-}
-
-// ---------------------------------------------------------------------------
-// 孤儿锁自愈：行为层（vm 实跑 patched withFileLock）
-// ---------------------------------------------------------------------------
-
-/** 载入 patched 产物并返回 { withFileLock }（node:fs/promises 直连真实 fs）。 */
-async function loadPatchedAtomicWrite() {
-  const src = readOrSkip(AW_FILE);
-  assert.ok(src !== null);
-  const patched = src.includes(ORPHAN_LOCK_MARKER) ? src : transformOrphanLock(src, 'aw').src;
-  const tmp = path.join(os.tmpdir(), `dsh-swr-aw-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
-  fs.writeFileSync(tmp, patched);
-  try {
-    return { mod: await import(`file:///${tmp.replace(/\\/g, '/')}`), tmp };
-  } catch (error) {
-    fs.rmSync(tmp, { force: true });
-    throw error;
-  }
-}
-
-test('orphan-lock: 死 PID 孤儿锁被清除并放行写入', async () => {
-  const { mod, tmp } = await loadPatchedAtomicWrite();
-  try {
-    const target = path.join(os.tmpdir(), `dsh-swr-t-${Date.now()}.yaml`);
-    const lock = target + '.lock';
-    fs.writeFileSync(lock, '999999\n'); // 不存在的 PID
-    let ran = false;
-    await mod.withFileLock(target, async () => { ran = true; }, { waitMs: 500 });
-    assert.equal(ran, true, '孤儿锁应被自愈，操作应执行');
-    assert.equal(fs.existsSync(lock), false, '操作完成后锁应被本持有者释放');
-    fs.rmSync(target, { force: true });
-  } finally {
-    fs.rmSync(tmp, { force: true });
-  }
-});
-
-test('orphan-lock: 活 PID 锁保持上游超时语义（不自愈）', async () => {
-  const { mod, tmp } = await loadPatchedAtomicWrite();
-  try {
-    const target = path.join(os.tmpdir(), `dsh-swr-t2-${Date.now()}.yaml`);
-    const lock = target + '.lock';
-    fs.writeFileSync(lock, `${process.pid}\n`); // 自己 = 活持有者
-    await assert.rejects(
-      () => mod.withFileLock(target, async () => {}, { waitMs: 150 }),
-      /timed out waiting for the writer lock/,
-    );
-    assert.equal(fs.existsSync(lock), true, '活锁不得被删除');
-    fs.rmSync(lock, { force: true });
-  } finally {
-    fs.rmSync(tmp, { force: true });
-  }
-});
-
-test('orphan-lock: 非数字锁体按存活处理（保守回退）', async () => {
-  const { mod, tmp } = await loadPatchedAtomicWrite();
-  try {
-    const target = path.join(os.tmpdir(), `dsh-swr-t3-${Date.now()}.yaml`);
-    const lock = target + '.lock';
-    fs.writeFileSync(lock, 'not-a-pid\n');
-    await assert.rejects(
-      () => mod.withFileLock(target, async () => {}, { waitMs: 150 }),
-      /timed out waiting for the writer lock/,
-    );
-    fs.rmSync(lock, { force: true });
-  } finally {
-    fs.rmSync(tmp, { force: true });
-  }
-});
 
 // ---------------------------------------------------------------------------
 // 设置页韧性：transform 层

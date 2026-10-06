@@ -15,9 +15,13 @@
 //       Anthropic 兼容 Messages API，其它协议的搜索服务需使用对应提供方）。
 //       0.1.2-alpha.2 起「实际请求地址」由上游 searchEndpointError 原生附带
 //       （pristine 实证），原 ` at ${endpoint}` 改写半边按先例退役。
-//  2. 设置页文案（dsh-client-ui-settings-plugins/lib/client.js，中英文）：
+//  2. 设置页文案（网页搜索设置页的中英文 locale 表）：
 //     「接口地址」提示改为明确说明协议契约（POST <基址>/messages），避免用户
 //     误以为可以填写任意搜索服务地址。
+//     0.2.0-rc.2 重靶：这块文案随设置页拆分搬家了——从
+//     dsh-client-ui-settings-plugins 的 `webSearch*` 前缀键，改为独立包
+//     dsh-client-ui-settings-web-search 的 `lib/client.js` 内联 locale 表
+//     `description` / `baseUrlHint`（值未变）。靶包与键名同步改锚。
 //
 // 用法：
 //   node scripts/patch-web-search-baseurl.js [<node_modules 根目录>]
@@ -55,25 +59,25 @@ const PROVIDER_NEW_THROW_LINES = [
 ];
 
 // ---------------------------------------------------------------------------
-// 设置页文案补丁（@deepseek-ai/dsh-client-ui-settings-plugins/lib/client.js）
+// 设置页文案补丁（@deepseek-ai/dsh-client-ui-settings-web-search/lib/client.js）
 // ---------------------------------------------------------------------------
 
 const CLIENT_PAIRS = [
   [
-    'webSearchDescription: "The DeepSeek search provider.",',
-    'webSearchDescription: "DeepSeek search provider (Anthropic-compatible Messages API).",',
+    'description: "Set up the DeepSeek search provider.",',
+    'description: "Set up the DeepSeek search provider (Anthropic-compatible Messages API).",',
   ],
   [
-    'webSearchBaseUrlHint: "Leave blank to use the provider default.",',
-    'webSearchBaseUrlHint: "This provider calls the Anthropic-compatible Messages API (POST <base>/messages). Enter that API\'s base URL; leave blank for the DeepSeek official default.",',
+    'baseUrlHint: "Leave blank to use the provider default.",',
+    'baseUrlHint: "This provider calls the Anthropic-compatible Messages API (POST <base>/messages). Enter that API\'s base URL; leave blank for the DeepSeek official default.",',
   ],
   [
-    'webSearchDescription: "DeepSeek 搜索提供方。",',
-    'webSearchDescription: "DeepSeek 搜索提供方（Anthropic 兼容 Messages API）。",',
+    'description: "设置 DeepSeek 的搜索提供方。",',
+    'description: "设置 DeepSeek 的搜索提供方（Anthropic 兼容 Messages API）。",',
   ],
   [
-    'webSearchBaseUrlHint: "留空则使用提供方默认地址。",',
-    'webSearchBaseUrlHint: "该提供方通过 Anthropic 兼容 Messages API 请求（POST <基址>/messages）。请填该协议的基址；留空则使用 DeepSeek 官方默认地址。",',
+    'baseUrlHint: "留空则使用提供方默认地址。",',
+    'baseUrlHint: "该提供方通过 Anthropic 兼容 Messages API 请求（POST <基址>/messages）。请填该协议的基址；留空则使用 DeepSeek 官方默认地址。",',
   ],
 ];
 
@@ -134,11 +138,11 @@ function patchClient(src) {
  */
 function patchWebSearchBaseUrl(nmRoot, log = () => {}, stats, options) {
   const targets = [
-    path.join(nmRoot, '@deepseek-ai', 'dsh-web-search-deepseek', 'lib', 'index.js'),
-    path.join(nmRoot, '@deepseek-ai', 'dsh-client-ui-settings-plugins', 'lib', 'client.js'),
+    [path.join(nmRoot, '@deepseek-ai', 'dsh-web-search-deepseek', 'lib', 'index.js'), patchProvider],
+    [path.join(nmRoot, '@deepseek-ai', 'dsh-client-ui-settings-web-search', 'lib', 'client.js'), patchClient],
   ];
   let changedFiles = 0;
-  for (const file of targets) {
+  for (const [file, patch] of targets) {
     if (!fs.existsSync(file)) continue;
     let src;
     try {
@@ -148,7 +152,6 @@ function patchWebSearchBaseUrl(nmRoot, log = () => {}, stats, options) {
       if (stats) stats.failed += 1;
       continue;
     }
-    const patch = file.includes('dsh-web-search-deepseek') ? patchProvider : patchClient;
     const result = patch(src);
     if (result.skipped) {
       log('web-search baseURL 补丁: 锚点未匹配（dsh 版本可能已变化），跳过 ' + file);

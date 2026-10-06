@@ -37,7 +37,8 @@ assert.equal(typeof REASONING_ROW_COLLAPSE_MARKER, 'string',
 assert.ok(REASONING_ROW_COLLAPSE_MARKER.length > 10, 'marker 不得是空/占位串');
 
 // pristine 源：vendored tarball 解包（dev 树已被 patch-deps 打过，幂等判定统一
-// 在 pristine 上做——与 unit-patch-model-image-input 同口径）。
+// 在 pristine 上做——与 unit-patch-deps-coverage.test.js D 的解包手法同口径；
+// 原同口径的 unit-patch-model-image-input 已随该规格在 0.2.0-rc.2 退役撤除）。
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 const CHAT_VENDOR_TARBALL = path.join(
   REPO_ROOT, 'dsh-desktop', 'vendor', 'dsh-kernel',

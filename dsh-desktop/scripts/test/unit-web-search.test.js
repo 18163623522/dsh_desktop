@@ -28,7 +28,7 @@ function buildFakeTree(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-ws-patch-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const provider = path.join(root, '@deepseek-ai', 'dsh-web-search-deepseek', 'lib', 'index.js');
-  const client = path.join(root, '@deepseek-ai', 'dsh-client-ui-settings-plugins', 'lib', 'client.js');
+  const client = path.join(root, '@deepseek-ai', 'dsh-client-ui-settings-web-search', 'lib', 'client.js');
   fs.mkdirSync(path.dirname(provider), { recursive: true });
   fs.mkdirSync(path.dirname(client), { recursive: true });
   const providerSrc = [
@@ -42,7 +42,22 @@ function buildFakeTree(t) {
     '\t\tthrow searchEndpointError(endpoint, message);',
     '}',
   ].join('\n');
+  // rc.2 现场：文案随设置页拆分搬到 dsh-client-ui-settings-web-search 的内联
+  // locale 表，键名由 webSearch* 前缀改为表内 description / baseUrlHint。
   const clientSrc = [
+    'window.__ModuleLoader__.load({',
+    '\tconst en = {',
+    '\t\tdescription: "Set up the DeepSeek search provider.",',
+    '\t\tbaseUrlHint: "Leave blank to use the provider default.",',
+    '\t};',
+    '\tconst zh = {',
+    '\t\tdescription: "设置 DeepSeek 的搜索提供方。",',
+    '\t\tbaseUrlHint: "留空则使用提供方默认地址。",',
+    '\t};',
+    '});',
+  ].join('\n');
+  // 0.1.6 及更早的旧形态（前缀键 + 旧靶包），用于反证锚点真的咬住了换代改动。
+  const legacyClientSrc = [
     'window.__ModuleLoader__.load({',
     '\twebSearchDescription: "The DeepSeek search provider.",',
     '\twebSearchBaseUrlHint: "Leave blank to use the provider default.",',
@@ -52,7 +67,7 @@ function buildFakeTree(t) {
   ].join('\n');
   fs.writeFileSync(provider, providerSrc);
   fs.writeFileSync(client, clientSrc);
-  return { root, provider, client, providerSrc, clientSrc };
+  return { root, provider, client, providerSrc, clientSrc, legacyClientSrc };
 }
 
 test('补丁脚本：一次应用、二次幂等、anchor 缺失跳过且不损坏', (t) => {
@@ -79,6 +94,20 @@ test('补丁脚本：一次应用、二次幂等、anchor 缺失跳过且不损�
   assert.strictEqual(n, 0, 'anchor 不匹配应跳过');
   assert.deepStrictEqual(fs.readFileSync(tree.provider), beforeP, 'provider 字节级不变');
   assert.deepStrictEqual(fs.readFileSync(tree.client), beforeC, 'client 字节级不变');
+});
+
+test('锚点新鲜度反证：旧形态前缀键（0.1.6 文案表）必须跳过 client 半边', (t) => {
+  // 这条判据证明 CLIENT_PAIRS 咬的是 rc.2 搬家后的 description/baseUrlHint，
+  // 而不是「任何一版都能命中」的宽松匹配。写回旧形态字节 → client 半边失配，
+  // provider 半边照常应用（两段独立，互不牵连）。
+  const tree = buildFakeTree(t);
+  fs.writeFileSync(tree.client, tree.legacyClientSrc);
+  const before = fs.readFileSync(tree.client);
+  const stats = { anchorMissing: 0, failed: 0 };
+  const n = patchWebSearchBaseUrl(tree.root, () => {}, stats);
+  assert.strictEqual(n, 1, '仅 provider 半边应被补');
+  assert.strictEqual(stats.anchorMissing, 1, 'client 半边失配应计入 anchorMissing');
+  assert.deepStrictEqual(fs.readFileSync(tree.client), before, '失配时 client 字节级不变');
 });
 
 // ---------------------------------------------------------------------------

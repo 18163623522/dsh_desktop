@@ -55,6 +55,11 @@ const CONFLICT_RETRY_MARKER = 'dsh-desktop patch (settings-conflict retry)';
 
 // ---------------------------------------------------------------------------
 // 根因一：dsh-atomic-write 孤儿锁自愈
+// 【0.2.0-rc.2 起休眠】—— 上游原生 takeOverExitedLock 覆盖了同一根因（竞争分支
+// 里按锁记录 PID 探活、ESRCH 即删锁重试，并用 takeover claim 独占文件兜双删竞态），
+// 本层零增量，已从 PATCH_SPECS 摘除。以下三个锚点保留是为了「版本回退时可复原」，
+// 不要顺手删；现行 rc.2 字节里 AW_CONTENTION_ANCHOR 已不存在（分支改写为
+// `} else if (await takeOverExitedLock(lockPath)) continue;`）。
 // ---------------------------------------------------------------------------
 
 /** import 行锚点（需为孤儿探测追加 readFile）。 */

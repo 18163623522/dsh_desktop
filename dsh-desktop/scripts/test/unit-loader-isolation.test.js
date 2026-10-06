@@ -1,7 +1,10 @@
 'use strict';
 
-// loader 自动隔离补丁单测：对 vendored rc.7 构建产物做锚点命中 / 幂等 /
-// 注入内容契约断言（受保护核心仍 fatal、标记行格式、隔离语义注入点）。
+// loader 自动隔离补丁单测。0.2.0-rc.2 起 tree-isolation 一层**已退役**（上游
+// cordis-plugin-loader 1.0.5 原生逐条目隔离），本文件改为：真实产物上验证退役
+// 哨兵（锚点整份失配 + 原生隔离正证）；合成夹具上保留 transform 行为契约（休眠
+// 补丁的实现面回归，参照 vision-key-fix 先例）；dsh-app-boot 的激活审计与
+// installFailLoud 两条仍是在役补丁，照旧做锚点命中 / 幂等 / 注入契约断言。
 // 绝不修改真实 node_modules（只读断言）。
 
 const test = require('node:test');
@@ -22,28 +25,20 @@ const repoRoot = path.resolve(__dirname, '..', '..');
 const loaderFile = path.join(repoRoot, 'node_modules', '@deepseek-ai', 'cordis-plugin-loader', 'lib', 'index.js');
 const appBootFile = path.join(repoRoot, 'node_modules', '@deepseek-ai', 'dsh-app-boot', 'lib', 'index.js');
 
-test('loader-isolation: 真实 vendored cordis-plugin-loader 锚点命中且幂等', () => {
+test('loader-isolation: 真实 vendored cordis-plugin-loader 已退役（rc.2 上游原生逐条目隔离）', () => {
+  // 0.2.0-rc.2 判定（patch-registry 已摘除 loader-tree-isolation 规格，理由见其注释）：
+  // cordis-plugin-loader 1.0.5 自己做到了 EntryGroup.update 每个 id 各自
+  // .catch(logger.error)、EntryTree.await 只 Promise.allSettled，旧「聚合失败再
+  // throw」的插入点不复存在 → 本层锚点整份失配（= 补丁退役，不是静默失效）。
+  // 这几条断言同时是**退役哨兵**：上游若把隔离改回抛出形态，throw 计数与
+  // allSettled 正证会翻红，提醒我们把补丁重新靶回去。
   const src = fs.readFileSync(loaderFile, 'utf8');
-  if (src.includes(LOADER_TREE_ISOLATION_MARKER)) {
-    // 集成测试/开发启动可能已把补丁落盘到 dev node_modules：此时验证
-    // 「已注入 → 幂等 already + 注入契约仍在」。
-    const r = transformLoaderTreeIsolation(src, loaderFile);
-    assert.equal(r.status, 'already');
-    assert.ok(src.includes('isolateEntryApplyFailures'));
-    assert.ok(src.includes('[loader-isolation]'));
-    return;
-  }
-  const r1 = transformLoaderTreeIsolation(src, loaderFile);
-  assert.equal(r1.status, 'changed', '锚点应命中真实产物');
-  const r2 = transformLoaderTreeIsolation(r1.src, loaderFile);
-  assert.equal(r2.status, 'already', '注入后幂等');
-  // 注入契约
-  assert.ok(r1.src.includes('isolateEntryApplyFailures'), 'update 失败分支已接隔离 helper');
-  assert.ok(r1.src.includes('isolateFiberFailures'), 'await 失败分支已接隔离 helper');
-  assert.ok(r1.src.includes('[loader-isolation]'), '标记行已注入');
-  assert.ok(r1.src.includes('@deepseek-ai/dsh-base'), '受保护核心名单已注入');
-  // 旧 throw 分支不再无条件抛出（已被替换）
-  assert.ok(!r1.src.includes('if (failures.length === 1) throw failures[0];'), '单失败 throw 已被隔离语义替换');
+  const r = transformLoaderTreeIsolation(src, loaderFile);
+  assert.equal(r.status, 'anchor-missing', 'rc.2 字节里不该再有可注入的失败分支');
+  assert.equal(src.split(LOADER_TREE_ISOLATION_MARKER).length - 1, 0, '不得残留本补丁 marker');
+  assert.equal(src.split('[loader-isolation]').length - 1, 0, '不得残留本补丁标记行');
+  assert.ok(src.includes('Promise.allSettled'), '上游 await 走 allSettled（原生隔离正证）');
+  assert.equal((src.match(/\bthrow\b/g) || []).length, 3, '全文件 throw 只剩条目查找错误 3 处（旧形态是 25 处）');
 });
 
 test('loader-isolation: 合成夹具锚点命中（与真实产物无关的漂移防线）', () => {

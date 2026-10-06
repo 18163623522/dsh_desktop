@@ -21,14 +21,17 @@
 //      全量重建走通 + NSIS 段 / 卸载器保留语义静态断言。
 //
 // 构造手法照抄 unit-composition-preflight.test.js / unit-agent-preset-fallback.test.js
-// / unit-fallback-heal-isolation.test.js。运行：node --test scripts/test/ta14-*.test.js
+// （原引用的 unit-fallback-heal-isolation.test.js 已随该规格在 0.2.0-rc.2 退役撤除）。
+// 运行：node --test scripts/test/ta14-*.test.js
 
 const test = require('node:test');
+const { after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
+const { spawnSync } = require('node:child_process');
 
 const { compositionPreflight } = require('../integration/fault-isolation');
 const { installBuiltinPresets, installBuiltinPreset } = require('../install-minimal-win-preset');
@@ -39,14 +42,38 @@ const {
 } = require('../../profile-bundle-heal');
 const { transformAgentPresetFallback } = require('../lib/patch-adapters');
 const { applyAll } = require('../integration/patch-runner');
+const { kernel } = require('../compat/kernel-pin.json');
 
 const appDir = path.resolve(__dirname, '..', '..'); // dsh-desktop 根（安装副本语义）
 const REPO_ROOT = path.resolve(appDir, '..');
-const PAYLOAD_PRESETS_DIR = path.join(
-  REPO_ROOT, 'dsh-tauri', 'package-payload', 'dsh-desktop',
-  'node_modules', '@deepseek-ai', 'dsh-agent-presets'
+
+// 安装树仿真源：vendored kernel-pin tarball 解包（手法同
+// unit-agent-preset-fallback.test.js）。此前这里指向
+// `dsh-tauri/package-payload/dsh-desktop/node_modules/@deepseek-ai/dsh-agent-presets`，
+// 而 payload 既不在 git 里、又被打包链就地打补丁（不是 pristine 源），
+// 一旦未暂存就 ENOENT、暂存了又只能验到「上一代已打补丁的字节」。
+// 0.2.0-rc.2：dsh-agent-presets 已拆成 dsh-agent-preset（声明）+
+// dsh-agent-preset-registry（注册表，resolve 硬抛点），靶包随之随迁。
+const PRESETS_VENDOR_TARBALL = path.join(
+  appDir, 'vendor', 'dsh-kernel',
+  `deepseek-ai-dsh-agent-preset-registry-${kernel.packageVersion}.tgz`,
 );
-const PRISTINE_INDEX = path.join(PAYLOAD_PRESETS_DIR, 'lib', 'index.js');
+
+/** 把 vendored tarball 解到一次性目录，返回解包后的包目录（package/）。 */
+function extractPristinePresets() {
+  assert.ok(fs.existsSync(PRESETS_VENDOR_TARBALL), '缺 vendored ' + kernel.packageVersion + ' tarball: ' + PRESETS_VENDOR_TARBALL);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ta14-pristine-'));
+  after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // win32 显式用系统自带 bsdtar（Git Bash 的 GNU tar 会把 "C:\" 当远程主机）。
+  const tarBin = process.platform === 'win32'
+    ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
+    : 'tar';
+  const res = spawnSync(tarBin, ['-xzf', PRESETS_VENDOR_TARBALL, '-C', dir], { encoding: 'utf8' });
+  assert.strictEqual(res.status, 0, 'tar 解包失败: ' + (res.stderr || ''));
+  return path.join(dir, 'package');
+}
+
+const PRISTINE_PRESETS_DIR = extractPristinePresets();
 
 function tmpdir(t, prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -72,11 +99,11 @@ function buildLegacyHome(t) {
   return home;
 }
 
-/** 安装树仿真：payload 的 dsh-agent-presets pristine 副本（回落补丁 applyAll 后）。 */
+/** 安装树仿真：vendored tarball 解出的 dsh-agent-preset-registry pristine 副本。 */
 function buildInstallTree(t) {
   const tree = tmpdir(t, 'ta14-install-');
-  const pkgDir = path.join(tree, 'node_modules', '@deepseek-ai', 'dsh-agent-presets');
-  fs.cpSync(PAYLOAD_PRESETS_DIR, pkgDir, { recursive: true });
+  const pkgDir = path.join(tree, 'node_modules', '@deepseek-ai', 'dsh-agent-preset-registry');
+  fs.cpSync(PRISTINE_PRESETS_DIR, pkgDir, { recursive: true });
   const ctx = { home: path.join(tree, 'unused-home'), appDir: tree, userDataDir: path.join(tree, 'ud'), wslMode: false, logs: [], log: () => {} };
   const run = applyAll(ctx);
   assert.equal(run.errors.length, 0, 'applyAll 不应有规格级异常: ' + JSON.stringify(run.errors));
@@ -85,19 +112,40 @@ function buildInstallTree(t) {
   return { tree, pkgDir };
 }
 
-/** 从 transform 产物抽出 resolve 方法体（与 unit-agent-preset-fallback 同手法）。 */
+/** 从 transform 产物抽出「注入的回落 helper + resolve 方法体」，vm 里按 rc.2 registry
+ *  的真实依赖面执行（definitions Map / diagnostic / defaultId，并把 resolve 接回自身
+ *  供回落递归）。与 unit-agent-preset-fallback 同手法。 */
 function makeResolve(patchedSrc) {
+  const hs = patchedSrc.indexOf('function __dshAgentPresetFallbackId(wanted, available) {');
+  assert.ok(hs !== -1, '产物应含注入的回落 helper');
+  const he = patchedSrc.indexOf('\n}', hs);
+  assert.ok(he !== -1, '应找到 helper 收尾');
+  const helperSrc = patchedSrc.slice(hs, he + '\n}'.length);
   const start = patchedSrc.indexOf('async resolve(id) {');
   assert.ok(start !== -1, '产物应含 resolve 方法');
   const end = patchedSrc.indexOf('\n\t\t}', start);
   const methodSrc = patchedSrc.slice(start, end + '\n\t\t}'.length);
   const warns = [];
-  class UnknownPresetError extends Error {}
-  const sandbox = { UnknownPresetError, warns, console: { warn: (m) => warns.push(String(m)) } };
-  const fn = vm.runInNewContext('({' + methodSrc + '}).resolve', sandbox);
+  class RemoteError extends Error {
+    constructor(code, message, props) {
+      super(message);
+      this.code = code;
+      Object.assign(this, props);
+    }
+  }
+  const sandbox = { RemoteError, warns, console: { warn: (m) => warns.push(String(m)) } };
+  const fn = vm.runInNewContext(helperSrc + '\n({\n' + methodSrc + '\n}).resolve', sandbox);
   return {
     warns,
-    call: (presets, id) => fn.call({ list: async () => presets, defaultId: 'standard' }, id),
+    call: (roster, id) => {
+      const self = {
+        definitions: new Map(roster.map((preset) => [preset.id, preset])),
+        diagnostic: async (record) => record.broken,
+        defaultId: 'standard',
+      };
+      self.resolve = (next) => fn.call(self, next);
+      return fn.call(self, id);
+    },
   };
 }
 
@@ -358,12 +406,25 @@ test('reinstall-static：覆盖安装前清理本树 node 并等句柄释放（�
   const nshCode = nshSrc.split('\n').filter(line => !line.trimStart().startsWith(';')).join('\n');
 
   // 1) 插入点与顺序：CheckIfAppIsRunning → kill → wait。
-  const checkIdx = nsiSrc.indexOf('!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe"');
+  //    只按宏名定位，不把实参写死成某一版模板的字面量：tauri-cli 2.12.1 起它改用
+  //    RestartManager API、要求传 $INSTDIR 全路径（该契约由下面的 1b 单独锁住）。
+  const checkIdx = nsiSrc.search(/!insertmacro\s+CheckIfAppIsRunning\b/);
   const killIdx = nsiSrc.indexOf('!insertmacro DSH_KILL_TREE_NODES');
   const waitIdx = nsiSrc.indexOf('!insertmacro DSH_WAIT_FOR_INSTDIR_RELEASE');
   assert.ok(checkIdx > 0, '模板里应有 CheckIfAppIsRunning');
   assert.ok(killIdx > checkIdx, 'DSH_KILL_TREE_NODES 必须在 CheckIfAppIsRunning 之后（先杀壳，Job Object 才带着内核树走）');
   assert.ok(waitIdx > killIdx, 'DSH_WAIT_FOR_INSTDIR_RELEASE 必须在 kill 之后（否则等的是自己刚杀的那批）');
+
+  // 1b) tauri-cli 2.12.1 的 RestartManager 契约：自定义模板必须自己 !include
+  //     Win\RestartManager.nsh，且 Install/Uninstall 两处调用点都传 $INSTDIR 全路径。
+  //     漏掉时不是运行期降级，而是 makensis 直接报
+  //     macro named "RestartManager_StartSession" not found —— 安装器根本编不出来。
+  assert.match(nsiSrc, /^!include "Win\\RestartManager\.nsh"/m, '模板必须 !include Win\\RestartManager.nsh');
+  const checkCalls = nsiSrc.match(/!insertmacro\s+CheckIfAppIsRunning[^\n]*/g) || [];
+  assert.strictEqual(checkCalls.length, 2, 'Install/Uninstall 应各有一处 CheckIfAppIsRunning');
+  for (const call of checkCalls) {
+    assert.ok(call.includes('"$INSTDIR\\${MAINBINARYNAME}.exe"'), '调用点必须传 $INSTDIR 全路径：' + call.trim());
+  }
 
   // 2) 两个宏都在钩子文件里定义，且 PREINSTALL 本体仍然为空（v0.5.1 的教训）。
   assert.match(nshCode, /!macro DSH_KILL_TREE_NODES/, '缺 DSH_KILL_TREE_NODES 定义');

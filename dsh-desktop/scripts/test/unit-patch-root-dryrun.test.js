@@ -79,9 +79,13 @@ const SCHED_TOOLS_PRISTINE = [
   '\t};',
 ].join('\n');
 
+// ⚠ 夹具逐字节即生产锚点：0.2.0-rc.2 把 callId 的镜像位从 content[0] 块
+// （block["toolCallId"]）上移到消息记录自身（messageRecord["toolCallId"]），此前这里没随迁，
+// transformToolSourceTolerance 因 OLD_2 失配整份 anchor-missing（真实 pristine 是 changed）。
+// 下方第 5 节的 driftedFixtureLines 是把这类漂移变成响亮失败的守卫。
 const TOOL_SESSION_PRISTINE = [
   '\tif (sourceRecord["kind"] !== "tool" || typeof sourceRecord["callId"] !== "string" || sourceRecord["callId"] === "") throw new Error(`${subject} message must have tool source`);',
-  '\tif (block["toolCallId"] !== sourceRecord["callId"]) throw new Error(`${subject} message has mismatched tool call ids`);',
+  '\tif (messageRecord["toolCallId"] !== sourceRecord["callId"]) throw new Error(`${subject} message has mismatched tool call ids`);',
 ].join('\n');
 
 const TOOL_LOOP_PRISTINE = [
@@ -277,4 +281,54 @@ test('settings-models-resilience: anchor-missing 计入 stats.anchorMissing', ()
     { [SETTINGS_MODELS_REL]: 'class X {}\n' },
     1,
   );
+});
+
+// ---------------------------------------------------------------------------
+// 5) 夹具字节漂移守卫
+//
+// 为什么要这一节（实测事故）：上面各组夹具是手抄的最小 pristine 字节。0.2.0-rc.2 把
+// tool source 的 callId 镜像位从 content[0] 块（block["toolCallId"]）上移到消息记录
+// 自身（messageRecord["toolCallId"]），生产锚点随迁了、夹具没随迁 →
+// transformToolSourceTolerance 整份 anchor-missing，而 dry-run 用例只报
+// 「anchorMissing 计数不对」，根因得手动 probe 才看得出来。
+// 这里直接核对「夹具每一行逐字节出现在真实 pristine 内核文件里」，把漂移变成响亮失败。
+// ---------------------------------------------------------------------------
+
+const { findPristineFile, describePristineRoots } = require('../lib/pristine-kernel-roots');
+
+/** 返回夹具里在真实 pristine 中找不到的行（空数组 = 夹具仍与生产同源）。 */
+function driftedFixtureLines(fixture, pkgRel) {
+  const file = findPristineFile(pkgRel);
+  if (!file) throw new Error('pristine 缺失: ' + pkgRel + '（查过 ' + describePristineRoots() + '）');
+  const src = fs.readFileSync(file, 'utf8');
+  return String(fixture).split('\n').filter((line) => line !== '' && !src.includes(line));
+}
+
+// 逐字节手抄、必须与生产同源的夹具。
+// 不纳入 SCHED_LOOP_PRISTINE：其中 `const a/b/c/d = ctx.tools[...]` 是占位行
+// （该 transform 按表达式片段 replaceAll，不是整行锚点），要求逐行 verbatim 会假红。
+const VERBATIM_FIXTURES = [
+  ['tool-source 读端', TOOL_SESSION_PRISTINE, SESSION_VALIDATION_REL],
+  ['tool-source 写端', TOOL_LOOP_PRISTINE, AGENT_LOOP_REL],
+  ['bundle-arrival-retry', LOADER_PRISTINE, CLIENT_MODULES_CLIENT_REL],
+  ['scheduler-guard(tools)', SCHED_TOOLS_PRISTINE, TOOLS_REL],
+];
+
+for (const [label, fixture, rel] of VERBATIM_FIXTURES) {
+  const pristineFile = findPristineFile(rel);
+  test(`夹具漂移守卫：${label} 的每一行都在真实 pristine 里`, { skip: pristineFile ? false : '无 pristine ' + rel + '（先跑 node scripts/install-pristine-kernel.mjs）' }, () => {
+    assert.deepEqual(
+      driftedFixtureLines(fixture, rel),
+      [],
+      `夹具 ${label} 相对 pristine ${rel} 已漂移——内核换代后生产锚点重靶了，夹具没随迁`,
+    );
+  });
+}
+
+// 反证：判据必须真的起作用——把读端夹具退回 rc.2 之前的旧字节，守卫要报出那一行。
+test('反证：rc.2 之前的旧字节（block["toolCallId"]）会被漂移守卫判为失配', { skip: findPristineFile(SESSION_VALIDATION_REL) ? false : '无 pristine ' + SESSION_VALIDATION_REL }, () => {
+  const stale = TOOL_SESSION_PRISTINE.replace('messageRecord["toolCallId"]', 'block["toolCallId"]');
+  const drifted = driftedFixtureLines(stale, SESSION_VALIDATION_REL);
+  assert.equal(drifted.length, 1, '旧字节那一行必须被判漂移');
+  assert.match(drifted[0], /block\["toolCallId"\]/);
 });

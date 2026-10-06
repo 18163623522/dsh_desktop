@@ -16,10 +16,20 @@
 // hook 订阅版本号；SessionTree 把版本号塞进 groups useMemo 的 deps ——
 // 切换置顶即时重排，无需整页刷新。
 //
-// 补丁顺序依赖：锚点基于已应用 open-project-dir（order 200）后的文本
-// （菜单数组含 open-folder 项）；本补丁 order 210 在其后执行。两者锚点
-// 互不重叠：open-project-dir 动 guard 行与 delete 项后的追加，本补丁动
-// rename 项前的插入与 onSelect 回调头部。
+// 锚点新鲜度（0.2.0-rc.2 重锚，registry order 215）：
+//   · UI_CORE 现锚 ProjectRowItem 的原生签名行（rc.2 形参表新增
+//     containsCurrentDescendant / newShortcut）；
+//   · UI_HOOKS 锚 ProjectRowItem 的 label 行（全文件唯一），不再用旧的
+//     menuOpen + menuRect 三连锚——menuRect 在 rc.2 原生代码里 0 命中，它是
+//     open-project-dir 补丁自己的产物，当原生锚必然失配；
+//   · UI_TREE 锚 SessionTree 的 expandedGroups useMemo（rc.2 里基于
+//     parents/workspaces），UI_DEPS 锚 groups useMemo deps 尾段（含 statuses），
+//     两者同函数体，由 verifyVersionScope() 配对校验，不通过则整体放弃本补丁；
+//   · UI_ZH/UI_EN 锚原生 "menu.unarchiveSession" 行（旧锚 menu.openProjectDir
+//     同样是 open-project-dir 的产物）。
+//
+// 与 open-project-dir（order 200）互不依赖：两补丁锚点字节区间不重叠，且各自
+// insert 都保留自己的锚，任意先后都能命中。
 //
 // 用法：
 //   node scripts/patch-workspace-pin.js [<node_modules 根目录>]
@@ -101,23 +111,23 @@ const CORE = [
 // ---------------------------------------------------------------------------
 
 // 1a. store + 排序逻辑注入（ProjectRowItem 签名前，模块工厂作用域内）。
-const UI_CORE_ANCHOR = '		function ProjectRowItem({ group, onToggle, onCreate, actions, drag, home, t }) {';
+const UI_CORE_ANCHOR = "\t\tfunction ProjectRowItem({ group, containsCurrentDescendant = false, onToggle, onCreate, actions, drag, home, newShortcut, t }) {";
 const UI_CORE_INSERT = CORE + '\n' + UI_CORE_ANCHOR;
 
 // 1b. 项目行 hooks 区：订阅版本号 + 读取置顶态（无条件 hook，Rules of Hooks 安全）。
-// menuRect state 经字节级实测在场（勿凭单次读数收窄锚点）。
+// rc.2 重锚：旧三连锚里的 `menuRect` state 在 rc.2 原生代码里全文件 0 命中（它其实是
+// open-project-dir 补丁自己的产物），拿来当原生锚必然失配。现锚在 ProjectRowItem 自己的
+// label 行（全文件唯一整行命中，且紧跟 `const row = group;` —— row 已声明）。
+// 与 open-project-dir 的 UI_PROJECT_STATE 锚（active + menuOpen 两行）字节区间不重叠，
+// 两个补丁任意先后都能命中。
 const UI_HOOKS_ANCHOR = [
-	'			const [menuOpen, setMenuOpen] = (0, react.useState)(false);',
-	'			const [menuRect, setMenuRect] = (0, react.useState)(null);',
-	'			const workspaceMenuItems = [{',
+	'			const label = row.workspaceId === void 0 ? t("group.ungrouped") : row.label;',
 ].join('\n');
 const UI_HOOKS_INSERT = [
-	'			const [menuOpen, setMenuOpen] = (0, react.useState)(false);',
-	'			const [menuRect, setMenuRect] = (0, react.useState)(null);',
+	'			const label = row.workspaceId === void 0 ? t("group.ungrouped") : row.label;',
 	'			// dsh-desktop patch (workspace pin): 订阅版本号驱动重渲染 + 读取置顶态。',
 	'			dshUseWorkspacePinVersion();',
 	'			const dshPinned = dshWorkspacePinState(row.workspaceId);',
-	'			const workspaceMenuItems = [{',
 ].join('\n');
 
 // 1c. 菜单项：rename 之前插入 pin 项（未分组桶无 workspaceId 不显示；icon 缺席
@@ -137,6 +147,9 @@ const UI_ITEMS_INSERT = [
 ].join('\n');
 
 // 1d. onSelect：pin 分支放在 open-project-dir 的 id guard 之前（互不触碰）。
+// rc.2 原生 guard 为 `if (id !== "rename" && id !== "delete") return;`（其上还有一行
+// `/* v8 ignore next */` 注释）；pin 分支在 setMenuOpen(false) 之后先行 return，
+// 既不被 guard 拒掉，也不碰 open-project-dir 改写的 guard 行。
 const UI_SELECT_ANCHOR = [
 	'							onSelect: (id) => {',
 	'								setMenuOpen(false);',
@@ -149,17 +162,8 @@ const UI_SELECT_INSERT = [
 ].join('\n');
 
 // 1e. folder 图标：置顶时着主题色（与 folderActive 同色系；active 另有行背景）。
-const UI_FOLDER_ANCHOR = [
-	'					(0, react_jsx_runtime.jsx)("span", {',
-	'						className: clsx(Rows_module_css_default.slot, Rows_module_css_default.folder, active && Rows_module_css_default.folderActive),',
-	'						children: row.expanded ? (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderOpen16, {}) : (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderClose16, {})',
-].join('\n');
-const UI_FOLDER_INSERT = [
-	'					(0, react_jsx_runtime.jsx)("span", {',
-	'						className: clsx(Rows_module_css_default.slot, Rows_module_css_default.folder, active && Rows_module_css_default.folderActive),',
-	'						style: dshPinned ? { color: "var(--dsw-alias-state-business-primary)" } : void 0,',
-	'						children: row.expanded ? (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderOpen16, {}) : (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderClose16, {})',
-].join('\n');
+const UI_FOLDER_ANCHOR = "\t\t\t\t\t(0, react_jsx_runtime.jsx)(\"span\", {\n\t\t\t\t\t\tclassName: clsx(Rows_module_css_default.slot, Rows_module_css_default.folder, active && Rows_module_css_default.folderActive),\n\t\t\t\t\t\tchildren: row.expanded ? (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderOpenRegular, {}) : (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderCloseRegular, {})";
+const UI_FOLDER_INSERT = "\t\t\t\t\t(0, react_jsx_runtime.jsx)(\"span\", {\n\t\t\t\t\t\tclassName: clsx(Rows_module_css_default.slot, Rows_module_css_default.folder, active && Rows_module_css_default.folderActive),\n\t\t\t\t\t\tstyle: dshPinned ? { color: \"var(--dsw-alias-state-business-primary)\" } : void 0,\n\t\t\t\t\t\tchildren: row.expanded ? (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderOpenRegular, {}) : (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconFolderCloseRegular, {})";
 
 // 1f. 标题前置顶小圆点（inline style，零 CSS 注入；title 是 ellipsis 行内容器）。
 const UI_TITLE_ANCHOR = [
@@ -210,50 +214,31 @@ const UI_SORT_INSERT = [
 // ——SessionTree 引用了未声明的 dshWsPinVersion，首渲染即
 // `ReferenceError: dshWsPinVersion is not defined` → sidebar.workspaces 槽位
 // 条目崩溃退位 → 左侧会话栏整体空白（用户实报「左边对话栏不显示」）。
-// 现锚在 SessionTree 自身的 expandedGroups 行（全文件唯一整行匹配；deriveGroups
-// 内另有一处同名局部量，但整行文本不同），且紧邻 groups useMemo ——声明先于使用。
-const UI_TREE_ANCHOR = '			const expandedGroups = (0, react.useMemo)(() => Object.entries(groupExpansion).filter(([, expanded]) => expanded).map(([key]) => key), [groupExpansion]);';
-const UI_TREE_INSERT = [
-	UI_TREE_ANCHOR,
-	'			// dsh-desktop patch (workspace pin): 版本号进 groups useMemo deps，切置顶即时重排。',
-	'			const dshWsPinVersion = dshUseWorkspacePinVersion();',
-].join('\n');
+// 现锚在 SessionTree 自身的 expandedGroups useMemo（rc.2 里它按 parents/
+// workspaces 求祖先键，整块在全文件唯一命中），且紧邻 groups useMemo ——声明先于使用。
+// rc.2 再重锚：该 memo 已从单行三元式变成多行 useMemo，锚必须整块匹配。
+const UI_TREE_ANCHOR = "\t\t\tconst expandedGroups = (0, react.useMemo)(() => {\n\t\t\t\tconst ancestorKeys = new Set(parents.values());\n\t\t\t\treturn [...workspaces.map((workspace) => workspace.workspaceId), \"\"].filter((key) => groupExpansion[key] ?? ancestorKeys.has(key));\n\t\t\t}, [\n\t\t\t\tgroupExpansion,\n\t\t\t\tparents,\n\t\t\t\tworkspaces\n\t\t\t]);";
+const UI_TREE_INSERT = "\t\t\tconst expandedGroups = (0, react.useMemo)(() => {\n\t\t\t\tconst ancestorKeys = new Set(parents.values());\n\t\t\t\treturn [...workspaces.map((workspace) => workspace.workspaceId), \"\"].filter((key) => groupExpansion[key] ?? ancestorKeys.has(key));\n\t\t\t}, [\n\t\t\t\tgroupExpansion,\n\t\t\t\tparents,\n\t\t\t\tworkspaces\n\t\t\t]);\n\t\t\t// dsh-desktop patch (workspace pin): 版本号进 groups useMemo deps，切置顶即时重排。\n\t\t\tconst dshWsPinVersion = dshUseWorkspacePinVersion();";
 
 // 2c. groups useMemo deps：追加版本号（唯一锚；否则置顶切换被 memo 缓存吞掉）。
 // 0.1.6 重锚：deps 集合变为 list/workspaces/archivedSessionIds/pendingInteractions/
 // expandedGroups/ungroupedSessionIds（deriveGroups 抽为独立函数，view 入参化）。
-const UI_DEPS_ANCHOR = [
-	'			}), [',
-	'				list,',
-	'				workspaces,',
-	'				archivedSessionIds,',
-	'				pendingInteractions,',
-	'				expandedGroups,',
-	'				ungroupedSessionIds',
-	'			]);',
-].join('\n');
-const UI_DEPS_INSERT = [
-	'			}), [',
-	'				list,',
-	'				workspaces,',
-	'				archivedSessionIds,',
-	'				pendingInteractions,',
-	'				expandedGroups,',
-	'				ungroupedSessionIds,',
-	'				dshWsPinVersion',
-	'			]);',
-].join('\n');
+const UI_DEPS_ANCHOR = "\t\t\t\tstatuses,\n\t\t\t\texpandedGroups,\n\t\t\t\tungroupedSessionIds\n\t\t\t]);";
+const UI_DEPS_INSERT = "\t\t\t\tstatuses,\n\t\t\t\texpandedGroups,\n\t\t\t\tungroupedSessionIds,\n\t\t\t\tdshWsPinVersion\n\t\t\t]);";
 
-// 3. 翻译：zh / en（与 menu.openProjectDir 同一字典段追加）。
-const UI_ZH_ANCHOR = '			"menu.openProjectDir": "打开项目目录",';
+// 3. 翻译：zh / en。rc.2 重锚：旧锚 `menu.openProjectDir` 是 open-project-dir
+//    补丁自己的产物（原生 0 命中），属于跨补丁链式依赖；现锚在原生
+//    "menu.unarchiveSession" 行，insert 保留锚（本补丁追加其后、open-project-dir
+//    插入其前），两补丁任意先后都能命中。
+const UI_ZH_ANCHOR = '			"menu.unarchiveSession": "取消归档",';
 const UI_ZH_INSERT = [
-	'			"menu.openProjectDir": "打开项目目录",',
+	'			"menu.unarchiveSession": "取消归档",',
 	'			"workspace.pin": "置顶到列表顶部",',
 	'			"workspace.unpin": "取消置顶",',
 ].join('\n');
-const UI_EN_ANCHOR = '			"menu.openProjectDir": "Open project directory",';
+const UI_EN_ANCHOR = '			"menu.unarchiveSession": "Unarchive session",';
 const UI_EN_INSERT = [
-	'			"menu.openProjectDir": "Open project directory",',
+	'			"menu.unarchiveSession": "Unarchive session",',
 	'			"workspace.pin": "Pin to top",',
 	'			"workspace.unpin": "Unpin",',
 ].join('\n');

@@ -35,19 +35,19 @@ const { applyAll } = require('../integration/patch-runner');
 const { kernel } = require('../compat/kernel-pin.json');
 
 const MARKER = 'dsh-desktop fix: agent-preset-fallback';
-// pristine 内核包源：vendored 0.1.2-alpha.3 tarball（vendor/dsh-kernel/，升级
-// 即换版——0.1.2-alpha.1 消费者安装产物已随内核换代过期，不再作 pristine 源）。
-// 0.1.2-alpha.2：resolve() 查无此 id 改抛多行 RemoteError("agent-preset/not-found")，
-// UnknownPresetError 消失，锚点与注入体已同步重靶（见 patch-adapters 注释）。
+// pristine 内核包源：vendored kernel-pin 版本 tarball（vendor/dsh-kernel/，升级即换版）。
+// 0.2.0-rc.2：预设 roster 包 dsh-agent-presets 已拆成 dsh-agent-preset（声明）+
+// dsh-agent-preset-registry（注册表）。resolve 的硬抛点在 registry，故本测试的靶包、
+// pkgDir 与断言全部随迁为 registry（仍是 lib/index.js + lib/invariant.js 双文件）。
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 const VENDOR_TARBALL = path.join(
   REPO_ROOT, 'dsh-desktop', 'vendor', 'dsh-kernel',
-  `deepseek-ai-dsh-agent-presets-${kernel.packageVersion}.tgz`,
+  `deepseek-ai-dsh-agent-preset-registry-${kernel.packageVersion}.tgz`,
 );
 
 /** 把 vendor tarball 解到一次性目录，返回解包后的包目录（package/）。 */
-function extractPristinePresets() {
-  assert.ok(fs.existsSync(VENDOR_TARBALL), '缺 vendored alpha.3 tarball: ' + VENDOR_TARBALL);
+function extractPristineRegistry() {
+  assert.ok(fs.existsSync(VENDOR_TARBALL), '缺 vendored ' + kernel.packageVersion + ' registry tarball: ' + VENDOR_TARBALL);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-apf-pristine-'));
   after(() => fs.rmSync(dir, { recursive: true, force: true }));
   // win32 显式用系统自带 bsdtar（Git Bash 的 GNU tar 会把 "C:\" 当远程主机）。
@@ -59,15 +59,15 @@ function extractPristinePresets() {
   return path.join(dir, 'package');
 }
 
-const PAYLOAD_PRESETS_DIR = extractPristinePresets();
+const PRISTINE_REGISTRY_DIR = extractPristineRegistry();
 const PRISTINE_FILES = ['lib/index.js', 'lib/invariant.js']
-  .map((rel) => path.join(PAYLOAD_PRESETS_DIR, rel))
+  .map((rel) => path.join(PRISTINE_REGISTRY_DIR, rel))
   .filter((f) => fs.existsSync(f));
 
-// 与上游 resolve() 抛错点逐字一致的锚点源（tarball 缺失时的独立 fixture）。
-// 0.1.2-alpha.2：查无此 id 抛多行 RemoteError("agent-preset/not-found", …,
-// { agentPreset, available })；锚点区段（found/if/throw/return）与 pristine
-// 实文逐字一致（3-tab 内层）。
+// 与上游 registry 同构的独立 fixture（tarball 缺失时的兜底源）。
+// 0.2.0-rc.2 形态：resolve()（类成员 2-tab、not-found 抛错 3-tab，经
+// this.definitions.get + this.diagnostic）与 retain()（mount 链路，not-found 抛错
+// 4-tab、包在 while(true) CAS 循环内）两处都硬抛；锚点区段与 tarball 实文逐字一致。
 const PRISTINE_RESOLVE = [
   'var RemoteError = class extends Error {',
   '\tconstructor(code, message, props) {',
@@ -76,22 +76,38 @@ const PRISTINE_RESOLVE = [
   '\t\tObject.assign(this, props);',
   '\t}',
   '};',
-  'var C = class {',
-  '\tasync resolve(id) {',
-  '\t\tconst wanted = id ?? this.defaultId;',
-  '\t\tconst presets = await this.list();',
-  '\t\t\tconst found = presets.find((preset) => preset.id === wanted);',
-  '\t\t\tif (found === void 0) {',
-  '\t\t\t\tconst available = presets.map((preset) => preset.id);',
-  '\t\t\t\tthrow new RemoteError("agent-preset/not-found", `agent-presets: preset "${wanted}" not found (available: ${available.join(", ") || "none"})`, {',
+  'function buildRegistry(_classSuper) {',
+  '\treturn class AgentPresetRegistry extends _classSuper {',
+  '\t\tasync diagnostic(record) {',
+  '\t\t\treturn record.broken;',
+  '\t\t}',
+  '\t\tasync resolve(id) {',
+  '\t\t\tconst wanted = id ?? this.defaultId;',
+  '\t\t\tconst record = this.definitions.get(wanted);',
+  '\t\t\tif (record === void 0) throw new RemoteError("agent-preset/not-found", `Unknown agent preset: ${wanted}`, {',
+  '\t\t\t\tagentPreset: wanted,',
+  '\t\t\t\tavailable: [...this.definitions.keys()]',
+  '\t\t\t});',
+  '\t\t\tconst broken = await this.diagnostic(record);',
+  '\t\t\treturn {',
+  '\t\t\t\tid: wanted,',
+  '\t\t\t\t...broken === void 0 ? {} : { broken }',
+  '\t\t\t};',
+  '\t\t}',
+  '\t\tasync retain(id) {',
+  '\t\t\tconst wanted = id ?? this.defaultId;',
+  '\t\t\twhile (true) {',
+  '\t\t\t\tconst record = this.definitions.get(wanted);',
+  '\t\t\t\tif (record === void 0) throw new RemoteError("agent-preset/not-found", `Unknown agent preset: ${wanted}`, {',
   '\t\t\t\t\tagentPreset: wanted,',
-  '\t\t\t\t\tavailable',
+  '\t\t\t\t\tavailable: [...this.definitions.keys()]',
   '\t\t\t\t});',
+  '\t\t\t\treturn this.resolve(wanted);',
   '\t\t\t}',
-  '\t\t\treturn found;',
-  '\t}',
-  '};',
-  'export { C, RemoteError };',
+  '\t\t}',
+  '\t};',
+  '}',
+  'export { buildRegistry, RemoteError };',
 ].join('\n');
 
 function tmpdir(t, prefix) {
@@ -121,7 +137,7 @@ test('锚点命中 payload pristine 源（index.js 与同源 invariant.js 双文
 });
 
 test('payload pristine 双文件均存在时逐文件覆盖（index.js 必在）', { skip: PRISTINE_FILES.length === 0 }, () => {
-  const rels = PRISTINE_FILES.map((f) => path.relative(PAYLOAD_PRESETS_DIR, f).split(path.sep).join('/'));
+  const rels = PRISTINE_FILES.map((f) => path.relative(PRISTINE_REGISTRY_DIR, f).split(path.sep).join('/'));
   assert.ok(rels.includes('lib/index.js'), '运行时实际加载的 lib/index.js 必须被覆盖');
 });
 
@@ -158,17 +174,24 @@ test('幂等：第二遍 already / 无锚点 anchor-missing 不改写', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * 从 transform 产物中抽出 resolve 方法体，在 vm 沙箱里以真实语义执行。
- * 沙箱提供上游同构的 RemoteError（0.1.2-alpha.2 起的查无此 id 抛错形态）与
- * console.warn 采集；receiver 提供 list()/defaultId——测试的是注入产物本身，
- * 不是复述实现。
+ * 从 transform 产物里抽出「注入的回落 helper + resolve 方法体」，在 vm 沙箱里按真实
+ * 语义执行——测的是注入产物本身，不是复述实现。
+ * 沙箱提供上游同构的 RemoteError（rc.2 的 not-found 抛错形态）与 console.warn 采集；
+ * receiver 按 0.2.0-rc.2 registry 的真实依赖面提供 definitions（Map）/ diagnostic /
+ * defaultId，并把 resolve 自身接回去（注入体回落时 `return this.resolve(fallbackId)`
+ * 递归一次即命中存在项终止）。
  */
 function makeResolve(patchedSrc) {
+  const hs = patchedSrc.indexOf('function __dshAgentPresetFallbackId(wanted, available) {');
+  assert.ok(hs !== -1, '产物应含注入的回落 helper');
+  const he = patchedSrc.indexOf('\n}', hs);
+  assert.ok(he !== -1, '应找到 helper 收尾');
+  const helperSrc = patchedSrc.slice(hs, he + '\n}'.length);
   const start = patchedSrc.indexOf('async resolve(id) {');
   assert.ok(start !== -1, '产物应含 resolve 方法');
-  const end = patchedSrc.indexOf('\n\t}', start);
+  const end = patchedSrc.indexOf('\n\t\t}', start);
   assert.ok(end !== -1, '应找到方法收尾');
-  const methodSrc = patchedSrc.slice(start, end + '\n\t}'.length);
+  const methodSrc = patchedSrc.slice(start, end + '\n\t\t}'.length);
   const warns = [];
   class RemoteError extends Error {
     constructor(code, message, props) {
@@ -178,18 +201,25 @@ function makeResolve(patchedSrc) {
     }
   }
   const sandbox = { RemoteError, warns, console: { warn: (m) => warns.push(String(m)) } };
-  const fn = vm.runInNewContext('({' + methodSrc + '}).resolve', sandbox);
+  const fn = vm.runInNewContext(helperSrc + '\n({\n' + methodSrc + '\n}).resolve', sandbox);
   return {
     warns,
     RemoteError,
-    call: (presets, id, defaultId = 'standard') =>
-      fn.call({ list: async () => presets, defaultId }, id),
+    call: (roster, id, defaultId = 'standard') => {
+      const self = {
+        definitions: new Map(roster.map((preset) => [preset.id, preset])),
+        diagnostic: async (record) => record.broken,
+        defaultId,
+      };
+      self.resolve = (next) => fn.call(self, next);
+      return fn.call(self, id);
+    },
   };
 }
 
 const ROSTER = ['standard', 'ptc', 'minimal', 'cordis'].map((id) => ({ id, path: `/<root>/${id}/agent.cordis.yml` }));
 
-test('回落：minimal-win → minimal（语义最近），warn 含原 id / 回落目标 / 原因 / 原错误', async () => {
+test('回落：minimal-win → minimal（语义最近），warn 含原 id / 可用清单 / 回落目标 / 原因', async () => {
   const h = makeResolve(transformAgentPresetFallback(PRISTINE_RESOLVE, 't.js').src);
   const preset = await h.call(ROSTER, 'minimal-win');
   assert.equal(preset.id, 'minimal', 'minimal-win 应回落 minimal');
@@ -198,7 +228,8 @@ test('回落：minimal-win → minimal（语义最近），warn 含原 id / 回�
   assert.ok(warn.includes('minimal-win'), '告警应含原 id');
   assert.ok(warn.includes('"minimal"'), '告警应含回落目标');
   assert.ok(warn.includes('回落'), '告警应说明回落原因');
-  assert.ok(warn.includes('not found'), '告警应保留原错误信息（UnknownPresetError.message）');
+  assert.ok(warn.includes('不存在'), '告警应说明该预设在当前安装中不存在');
+  assert.ok(warn.includes('可用：'), '告警应列出可用预设清单（用户据此重选）');
 });
 
 test('回落：其他未知 id → standard（保底）', async () => {
@@ -229,7 +260,7 @@ test('回落：minimal-win 但 roster 无 minimal → standard 兜底；standard
     () => assert.fail('空 roster 应抛 RemoteError'),
     (err) => err
   );
-  assert.ok(empty.message.includes('minimal-win') && empty.message.includes('not found'));
+  assert.ok(empty.message.includes('minimal-win') && empty.message.includes('Unknown agent preset'));
   assert.equal(h2.warns.length, 0, '未发生回落不应告警');
   // 仅 ptc（standard 保底也缺失）：无可回落 → 原样硬抛，不告警。
   const h3 = mk();
@@ -238,35 +269,47 @@ test('回落：minimal-win 但 roster 无 minimal → standard 兜底；standard
     (err) => err
   );
   assert.equal(ptcOnly.agentPreset, 'minimal-win');
+  // available 出自 vm 沙箱（另一 realm 的 Array 原型），取回本 realm 再比。
+  assert.deepEqual([...ptcOnly.available], ['ptc'], '抛错的 available 属性应是 registry 真实定义面');
   assert.equal(h3.warns.length, 0, '未发生回落不应告警');
 });
 
-test('已知 id 直通：原语义不变（返回同一 preset、不告警、不改 roster）', async () => {
+test('已知 id 直通：原语义不变（返回该 id 的身份记录、不告警）', async () => {
   const h = makeResolve(transformAgentPresetFallback(PRISTINE_RESOLVE, 't.js').src);
   const preset = await h.call(ROSTER, 'cordis');
   assert.equal(preset.id, 'cordis');
-  assert.equal(preset, ROSTER.find((p) => p.id === 'cordis'), '应返回 roster 同一对象');
+  // rc.2 registry 的 resolve 返回新构造的身份对象（{ id, ...broken }），
+  // 不再是 roster 里的原引用——直通判据改为「命中同一 record 且不告警」。
+  assert.equal(preset.broken, void 0, '健康预设不应带 broken 字段');
   assert.equal(h.warns.length, 0, '已知 id 不得告警');
 });
 
-test('PresetMountError 不回落：补丁只动 Unknown 分支，resolveMountable 保持硬抛', async () => {
+test('broken 预设不回落：补丁只动 not-found 分支，diagnostic（组合损坏）通道逐字不变', async () => {
   const changed = transformAgentPresetFallback(PRISTINE_RESOLVE, 't.js');
-  // 注入代码不制造 / 不拦截挂载错误，也不触碰 resolveMountable 调用方。
+  // 注入代码不制造挂载期错误，也不触碰 broken 判定通道。
   assert.ok(!changed.src.includes('new PresetMountError'), '注入不得伪造/改写 PresetMountError 抛错');
-  assert.ok(!changed.src.includes('resolveMountable'), '注入不得触碰 resolveMountable');
-  // pristine tarball 上更强的字节级证明：resolveMountable 方法体变换前后逐字一致。
+  assert.equal(
+    changed.src.split('this.diagnostic(record)').length - 1,
+    PRISTINE_RESOLVE.split('this.diagnostic(record)').length - 1,
+    '注入不得增删 diagnostic（broken）调用点',
+  );
+  // pristine tarball 上更强的字节级证明：diagnostic 方法体变换前后逐字一致
+  //（rc.2 里 broken 由 this.diagnostic(record) 给出，被回落吞掉就等于把
+  //  「部署真坏了」静默降级成「继续跑」，这是本补丁明确不做的事）。
   if (PRISTINE_FILES.length > 0) {
     const src = fs.readFileSync(PRISTINE_FILES[0], 'utf8');
     const out = transformAgentPresetFallback(src, PRISTINE_FILES[0]);
     const extract = (s) => {
-      const start = s.indexOf('\t\tasync resolveMountable(id) {');
-      assert.ok(start !== -1, 'pristine 源应含 resolveMountable');
+      const start = s.indexOf('\t\tasync diagnostic(record) {');
+      assert.ok(start !== -1, 'pristine 源应含 diagnostic');
       const end = s.indexOf('\n\t\t}', start);
+      assert.ok(end !== -1, '应找到 diagnostic 收尾');
       return s.slice(start, end + '\n\t\t}'.length);
     };
-    assert.equal(extract(out.src), extract(src), 'resolveMountable 方法体必须逐字不变（broken 预设仍硬抛）');
+    assert.equal(extract(out.src), extract(src), 'diagnostic 方法体必须逐字不变（broken 预设仍响亮）');
   }
-  // 行为面：上游同构 resolveMountable 在 broken 预设上仍硬抛（回落只管 Unknown）。
+  // 行为面：已知但 broken 的预设，resolve 照常返回 { id, broken }（不告警、不回落），
+  // 上层的 resolveMountable 语义（broken 即拒挂）仍硬抛。
   class PresetMountError extends Error {}
   const resolveMountable = async (resolve, id) => {
     const preset = await resolve(id);
@@ -278,7 +321,7 @@ test('PresetMountError 不回落：补丁只动 Unknown 分支，resolveMountabl
   await assert.rejects(
     () => resolveMountable((id) => h.call(rosterWithBroken, id), 'standard'),
     (err) => err instanceof PresetMountError && /standard/.test(err.message),
-    'broken 预设应仍由 resolveMountable 硬抛 PresetMountError，而非被回落吞掉'
+    'broken 预设应仍由挂载校验硬抛，而非被回落吞掉'
   );
   assert.equal(h.warns.length, 0, '已知 id（哪怕 broken）不走回落、不告警');
 });
@@ -300,7 +343,7 @@ test('registry：agent-preset-fallback 规格装配与布局正确', () => {
   assert.equal(markers.AGENT_PRESET_FALLBACK_MARKER, MARKER, 'marker 单一数据源导出');
   assert.deepEqual(
     AGENT_PRESET_FALLBACK_PKG_RELS.map((r) => r.split(path.sep).join('/')),
-    ['dsh-agent-presets/lib/index.js', 'dsh-agent-presets/lib/invariant.js'],
+    ['dsh-agent-preset-registry/lib/index.js', 'dsh-agent-preset-registry/lib/invariant.js'],
     '目标双文件：运行时入口 index.js + 同源 invariant.js'
   );
   // CLI 清单不受影响（cli:false 不进 getSpecsByCli）。
@@ -312,11 +355,11 @@ test('registry：runtime-local / wsl 布局落点覆盖内核可加载副本', (
   const ctx = { home: 'C:\\h', appDir: 'C:\\app', userDataDir: 'C:\\ud', wslMode: false };
   const local = resolvePatchTargets(ctx, { ...spec, pkgRel: spec.pkgRels[0] });
   const norm = (f) => f.split(path.sep).join('/');
-  assert.ok(local.some((f) => norm(f) === 'C:/app/node_modules/@deepseek-ai/dsh-agent-presets/lib/index.js'), '本地三副本须含 appDir 内核副本');
+  assert.ok(local.some((f) => norm(f) === 'C:/app/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js'), '本地三副本须含 appDir 内核副本');
   assert.ok(local.some((f) => norm(f).startsWith('C:/h/profiles/node_modules/')), '含 profile fallback 副本');
   assert.ok(local.some((f) => norm(f).startsWith('C:/ud/agent/node_modules/')), '含 agent overlay 副本');
   const wsl = resolvePatchTargets({ ...ctx, wslMode: true }, { ...spec, pkgRel: spec.pkgRels[0] });
-  assert.ok(wsl.some((f) => norm(f) === 'C:/h/agent/node_modules/@deepseek-ai/dsh-agent-presets/lib/index.js'), 'WSL 布局须含 UNC agent 副本');
+  assert.ok(wsl.some((f) => norm(f) === 'C:/h/agent/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js'), 'WSL 布局须含 UNC agent 副本');
 });
 
 // ---------------------------------------------------------------------------
@@ -327,10 +370,10 @@ test('applyAll 集成：payload pristine 副本首遍 changed、次遍 already�
   const home = tmpdir(t, 'dsh-apf-home-');
   const appDir = tmpdir(t, 'dsh-apf-app-');
   const userDataDir = tmpdir(t, 'dsh-apf-ud-');
-  // 复制 payload 的 dsh-agent-presets pristine 副本到 appDir 内核落点。
-  assert.ok(PRISTINE_FILES.length > 0, 'payload pristine 源缺失，无法做集成验证');
-  const pkgDir = path.join(appDir, 'node_modules', '@deepseek-ai', 'dsh-agent-presets');
-  fs.cpSync(PAYLOAD_PRESETS_DIR, pkgDir, { recursive: true });
+  // 复制 vendor 解出的 dsh-agent-preset-registry pristine 副本到 appDir 内核落点。
+  assert.ok(PRISTINE_FILES.length > 0, 'pristine 源缺失，无法做集成验证');
+  const pkgDir = path.join(appDir, 'node_modules', '@deepseek-ai', 'dsh-agent-preset-registry');
+  fs.cpSync(PRISTINE_REGISTRY_DIR, pkgDir, { recursive: true });
   const logs = [];
   const ctx = { home, appDir, userDataDir, wslMode: false, logs, log: (m) => logs.push(m) };
 

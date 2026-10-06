@@ -49,8 +49,11 @@ const HELPER = [
 const ANCHORS = [
   {
     id: 'toolsOf-outbound',
-    needle: 'function toolsOf(options) {\n\treturn options.tools?.map((tool) => ({\n\t\tname: tool.name,',
-    replace: 'function toolsOf(options) {\n\treturn options.tools?.map((tool) => ({\n\t\tname: __dshPiWireToolName(tool.name),',
+    // 只锚「return + name:」两行：0.2.0-rc.2 在 toolsOf 开头插了一行 deferLoading
+    // 守卫（throw LlmError），带函数签名的三行锚点因此失配；两行形态在 0.1.6 与
+    // rc.2 上都恰好命中一次，比追上游的行序更耐漂移。
+    needle: '\treturn options.tools?.map((tool) => ({\n\t\tname: tool.name,',
+    replace: '\treturn options.tools?.map((tool) => ({\n\t\tname: __dshPiWireToolName(tool.name),',
   },
   {
     id: 'toolcall-inbound',

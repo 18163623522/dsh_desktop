@@ -97,7 +97,7 @@ function transformToolNameMojibake(src, file, options = {}) {
  * 对某个 node_modules 根目录应用「工具名怪字符归一化」补丁（幂等）。
  * @param {string} nmRoot node_modules 根目录
  * @param {(msg: string) => void} [log]
- * @param {{anchorMissing182?: number, mojibakeFailed?: number}} [stats]
+ * @param {{mojibakeFailed?: number}} [stats]
  * @param {{dryRun?: boolean}} [options]
  * @returns {number} 实际发生修改的文件数
  */

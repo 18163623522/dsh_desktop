@@ -2,6 +2,14 @@
 
 // patch-model-image-input.js — 模型设置页逐模型「支持图片输入」勾选。
 //
+// 【0.2.0-rc.2 起休眠，PATCH_SPECS 已删该条】上游把这条链原生化了：
+// dsh-client-ui-settings-models 新增 ModelInputTypes（client.js:171）在展开区
+// 渲染 ["text","image"] 复选框（字段 inputModalities，:485），adopt() 白名单
+// 已保留端点自报模态（:580），门槛亦改为「已声明且不含 image 才拒」
+// （dsh-api-session-controller:873 / dsh-llm:2311），typert.host.js:19 把
+// inputModalities 收进 zod schema。下述背景记录的是 0.1.x 的因果，别当现状读；
+// 版本回退时若要复用，先重测锚点。
+//
 // 背景（2026-09-05 用户故障「某些多模态模型依旧说不支持图片」定案）：
 //
 //   因果链（每一环都已逐字核对产物）——

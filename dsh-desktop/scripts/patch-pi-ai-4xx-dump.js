@@ -30,9 +30,25 @@ const MARKER = 'dsh-desktop patch (pi-ai 4xx request dump)';
 const ANCHOR = 'catch (error) {\n            for (const block of output.content) {';
 /** 顶部 import 锚点：在首个 import 前注入 fs/path 的 ESM import（该文件是 ESM，catch 内不能用 require）。 */
 const IMPORT_ANCHOR = 'import OpenAI from "openai";';
-/** params 捕获锚点：buildParams 赋值行（params 是 try 块作用域，catch 里不可见，需经 globalThis 传递）。 */
-const PARAMS_ANCHOR = 'let params = buildParams(model, context, options, compat, cacheRetention, grammarToolInputProperties);';
-const PARAMS_INJECT = PARAMS_ANCHOR + '\n            try { globalThis.__dsh4xxLastParams = params; globalThis.__dsh4xxLastModel = model; } catch {}';
+/** params 捕获锚点：buildParams 赋值行（params 是 try 块作用域，catch 里不可见，需经 globalThis 传递）。
+ *  pi-ai 0.87.x 起上游把第二参从 `context` 改写成 `normalizedContext`，并把
+ *  onPayload 改写夹在同一位置——而 onPayload 正是本补丁要怀疑的那一层（它会替换
+ *  params 后才发请求）。因此 V2 锚点吃掉整块（buildParams + onPayload 改写），
+ *  把快照挪到真正上行的那一刻；V1 单行形态仅作为旧版 pi-ai 的回落锚点。 */
+const PARAMS_CAPTURE_SUFFIX = '\n            try { globalThis.__dsh4xxLastParams = params; globalThis.__dsh4xxLastModel = model; } catch {}';
+const PARAMS_ANCHOR_V1 = 'let params = buildParams(model, context, options, compat, cacheRetention, grammarToolInputProperties);';
+const PARAMS_ANCHOR = [
+  'let params = buildParams(model, normalizedContext, options, compat, cacheRetention, grammarToolInputProperties);',
+  '            const nextParams = await options?.onPayload?.(params, model);',
+  '            if (nextParams !== undefined) {',
+  '                params = nextParams;',
+  '            }',
+].join('\n');
+/** 两代锚点配对（[锚点, 锚点 + 快照行]），任一命中即注入。 */
+const PARAMS_PAIRS = [
+  [PARAMS_ANCHOR, PARAMS_ANCHOR + PARAMS_CAPTURE_SUFFIX],
+  [PARAMS_ANCHOR_V1, PARAMS_ANCHOR_V1 + PARAMS_CAPTURE_SUFFIX],
+];
 
 /**
  * 注入体：在 openai-completions stream() 的 catch 开头插一段 4xx 落盘。
@@ -99,7 +115,8 @@ function transform4xxDump(src, file) {
     }
     return { status: 'already' }; // marker 在但形态不可识别，保守不改写
   }
-  if (!src.includes(ANCHOR) || !src.includes(IMPORT_ANCHOR) || !src.includes(PARAMS_ANCHOR)) {
+  const paramsPair = PARAMS_PAIRS.find(([anchor]) => src.includes(anchor));
+  if (!src.includes(ANCHOR) || !src.includes(IMPORT_ANCHOR) || !paramsPair) {
     return {
       status: 'anchor-missing',
       detail: '未找到 stream() catch / import / buildParams 锚点（pi-ai 版本可能已变化），跳过 ' + (file || '<unknown>'),
@@ -107,7 +124,7 @@ function transform4xxDump(src, file) {
   }
   const out = src
     .replace(IMPORT_ANCHOR, IMPORT_INJECT)
-    .replace(PARAMS_ANCHOR, PARAMS_INJECT)
+    .replace(paramsPair[0], paramsPair[1])
     .replace(ANCHOR, INJECT);
   return { status: 'changed', src: out };
 }

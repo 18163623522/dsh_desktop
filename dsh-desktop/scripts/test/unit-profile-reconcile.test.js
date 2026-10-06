@@ -7,9 +7,10 @@
 //     重置恢复 / dry-run 零落盘 / 恢复健康后隔离记录清除 / 记录文件容错）；
 //   · CLI 契约（initMissing=false：缺失 manifest 不凭空创建，损坏且核心不可
 //     解析时不落盘空骨架）；
-//   · 真实 dsh-app-boot 复现：无效登记在官方 loadProfile 下必崩（用户反馈的
-//     "declares no dsh.bundle" 原始错误），对账后正常装配（仓库 node_modules
-//     已安装时执行）；
+//   · 真实 dsh-app-boot 复现：无 dsh.bundle 声明的登记被 rc.2 上游逐 bundle 原生
+//     跳过（skippedBundles + stderr 诊断，不再击穿启动；旧内核的
+//     "declares no dsh.bundle" 必崩形态有 pristine 字节正证），对账后从清单
+//     移除并落隔离记录（仓库 node_modules 已安装时执行）；
 //   · issue #132：pnpm 虚拟仓回落（不可穿透符号链接 / scoped / 版本选择 /
 //     传递依赖门 / junction）与 WSL UNC 防误删保护（解析受限 unverifiable →
 //     保留登记仅告警、清除历史误判隔离记录；本地路径确证缺失语义不变）。
@@ -21,6 +22,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
+const { findPristineFile, describePristineRoots } = require('../lib/pristine-kernel-roots');
 
 const {
   BUNDLE_CHECK_CODES,
@@ -1189,7 +1191,7 @@ test('reconcile: 恢复健康后隔离记录清除；记录文件损坏容错', 
 // 真实 dsh-app-boot 复现（仓库 node_modules 已安装时执行）
 // ---------------------------------------------------------------------------
 
-test('真实 dsh-app-boot：无 dsh.bundle 声明登记必崩（用户反馈原始错误），对账后正常装配', async (t) => {
+test('真实 dsh-app-boot：无 dsh.bundle 声明登记被逐 bundle 原生跳过，对账后正常装配', async (t) => {
   const appBootIndex = path.join(repoRoot, 'node_modules', '@deepseek-ai', 'dsh-app-boot', 'lib', 'index.js');
   const dshAnchor = path.join(repoRoot, 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
   if (!fs.existsSync(appBootIndex) || !fs.existsSync(dshAnchor)) {
@@ -1214,22 +1216,19 @@ test('真实 dsh-app-boot：无 dsh.bundle 声明登记必崩（用户反馈原�
   }, null, 2) + '\n');
 
   const mod = await import(pathToFileURL(appBootIndex).href);
-  const guarded = fs.readFileSync(appBootIndex, 'utf8').includes('dsh-desktop guard: a broken profile bundle must not brick');
-  // 1. 未打防护补丁的官方 loadProfile 对无 dsh.bundle.patch 的登记 fail-loud
-  //    （同步抛错）——即用户「dsh web 启动失败（退出码 1）」的原始错误。
-  //    已打补丁（集成测试跑过、guard 已注入）时该形状被跳过而非崩溃，两种
-  //    状态都给出有意义断言。
-  if (!guarded) {
-    assert.throws(
-      () => mod.loadProfile('dsh', 'web', dshAnchor, home),
-      /declares no dsh\.bundle/,
-    );
-  } else {
-    const pre = mod.loadProfile('dsh', 'web', dshAnchor, home);
-    const layer = pre.layers.find((l) => l.packageName === '@dsh-external/gold-luxe');
-    assert.ok(layer && layer.packageDir === null && Array.isArray(layer.patches) && layer.patches.length === 0,
-      'guard 已注入时该层应被跳过（packageDir=null、无补丁）');
-  }
+  // rc.2 起「逐 bundle 容错」由上游原生实装：loadProfileDirectory 内
+  // `for (const packageName of bundles) try {…} catch { skippedBundles.push(…) }`
+  // + reportSkippedBundles 打 stderr。所以这条形状在打过我们守卫的树与 pristine 上
+  // 表现一致，不再按 guard 是否在场分两支断言（旧分支的「官方 fail-loud」是
+  // ≤0.1.6-alpha.1 的形状，见下方 pristine 字节正证）。
+  const pre = mod.loadProfile('dsh', 'web', dshAnchor, home);
+  assert.equal(pre.layers.filter((l) => l.packageName === '@dsh-external/gold-luxe').length, 0,
+    '坏登记不得进入装配层');
+  const skipped = pre.skippedBundles.filter((s) => s.packageName === '@dsh-external/gold-luxe');
+  assert.equal(skipped.length, 1, '应被列进 skippedBundles: ' + JSON.stringify(pre.skippedBundles));
+  assert.match(String(skipped[0].reason), /declares no dsh\.bundle/,
+    '跳过原因必须保住内核原文（用户据此定位是哪个包缺声明）');
+  assert.deepEqual(pre.layers.map((l) => l.packageName), CORES, '一家不合法不得牵连核心 bundles');
   // 2. 对账后：无效登记移除，loadProfile 正常装配核心 bundles。
   reconcileProfileBundles(profileDir, {
     installAnchorDir: path.dirname(dshAnchor),
@@ -1243,6 +1242,26 @@ test('真实 dsh-app-boot：无 dsh.bundle 声明登记必崩（用户反馈原�
   assert.ok(!manifest.dsh.profile.bundles.includes('@dsh-external/gold-luxe'), '无效登记应已移除');
   const record = readBrokenBundlesRecord(recordFile(profileDir));
   assert.equal(record.entries['@dsh-external/gold-luxe'].code, BUNDLE_CHECK_CODES.NO_BUNDLE_DECL, '隔离记录应记录移除原因');
+});
+
+test('pristine 正证：逐 bundle 容错是 rc.2 上游自带的，我们的守卫只补它没覆盖的两处', (t) => {
+  // 「容错来自上游」这件事必须被证明，否则下一条用例的跳过断言可能被误读成
+  // 「我们的守卫又兜住了一次」——而那会让守卫在真正该退役时退役不掉。
+  const file = findPristineFile(path.join('dsh-app-boot', 'lib', 'index.js'));
+  if (!file) { t.skip('无 pristine dsh-app-boot（查过 ' + describePristineRoots() + '）'); return; }
+  const src = fs.readFileSync(file, 'utf8');
+  assert.ok(!src.includes('dsh-desktop guard'), 'pristine 树不得带我们的守卫，否则这条正证看的是打过补丁的字节');
+  assert.match(src, /for \(const packageName of bundles\) try \{/, '逐 bundle 的 try 圈应在 pristine 里在场');
+  assert.ok(src.includes('declares no dsh.bundle in its package.json'), '抛出点仍在那圈 try 内（抛即被收容）');
+  assert.ok(src.includes('skippedBundles.push('), 'catch 应把坏包登记进 skippedBundles');
+  assert.ok(src.includes('reportSkippedBundles('), '跳过要有 stderr 诊断（静默跳过等于没报错）');
+
+  // 守卫的增量面（上游留在 try 之外的两处）也必须真的在场。
+  const installed = path.join(repoRoot, 'node_modules', '@deepseek-ai', 'dsh-app-boot', 'lib', 'index.js');
+  if (!fs.existsSync(installed)) { t.skip('仓库 node_modules 未安装'); return; }
+  const boot = fs.readFileSync(installed, 'utf8');
+  assert.ok(boot.includes('function loadProfileManifestSafe'), '增量①：profile package.json 损坏 → 备份后按出厂模板重建');
+  assert.ok(boot.includes('function loadProfileBundlesSafe'), '增量②：dsh.profile.bundles 非数组 → 告警空 bundles 而不是 for…of 击穿启动');
 });
 
 test('真实 dsh-app-boot：入口文件缺失（guard 覆盖不到的崩溃形状）由对账消除', async (t) => {

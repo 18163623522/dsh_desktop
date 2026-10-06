@@ -412,21 +412,17 @@ test('fail-loud 行为: armed 不 exit + crash-shield 标记、未 armed exit(1)
   assert.ok(out.armed.some((l) => l.includes('late boom')));
 });
 
-// ── 3. 锚点 vs 真实 vendored 产物 ────────────────────────────────────────────
-test('vendored cordis-plugin-loader: 已变换 → marker + 注入体在位，transform 返回 already', () => {
+// ── 3. 锚点 vs 真实 vendored 产物（0.2.0-rc.2：tree-isolation 一层已退役）─────
+test('vendored cordis-plugin-loader: rc.2 锚点整份失配 = 退役，非静默漏投', () => {
   const src = fs.readFileSync(loaderFile, 'utf8');
-  const transformed = src.includes(LOADER_TREE_ISOLATION_MARKER) && src.includes('function isolateEntryApplyFailures(') && src.includes('function isolateFiberFailures(');
-  if (transformed) {
-    // 已变换：跳过「锚点出现一次」计数，改断言 marker + 注入体在位。
-    assert.ok(src.includes(LOADER_TREE_ISOLATION_MARKER));
-    assert.ok(src.includes('function isolateEntryApplyFailures('));
-    assert.ok(src.includes('function isolateFiberFailures('));
-    assert.equal(transformLoaderTreeIsolation(src, loaderFile).status, 'already');
-  } else {
-    assert.equal(countOccurrences(src, LOADER_UPDATE_OUTCOMES_OLD), 1);
-    assert.equal(countOccurrences(src, LOADER_AWAIT_FAILURES_OLD), 1);
-    assert.equal(countOccurrences(src, LOADER_HELPERS_ANCHOR), 1);
-  }
+  const transformed = src.includes(LOADER_TREE_ISOLATION_MARKER);
+  assert.equal(transformed, false, '退役后 dev 树里不该有本补丁 marker');
+  assert.equal(countOccurrences(src, LOADER_UPDATE_OUTCOMES_OLD), 0, 'update 聚合失败锚点应已消失');
+  assert.equal(countOccurrences(src, LOADER_AWAIT_FAILURES_OLD), 0, 'await 聚合失败锚点应已消失');
+  assert.equal(transformLoaderTreeIsolation(src, loaderFile).status, 'anchor-missing');
+  // 上游原生隔离的正证（回归旧形态时这里翻红 → 重新上补丁）。
+  assert.ok(src.includes('Promise.allSettled'), 'EntryTree.await 走 allSettled');
+  assert.equal((src.match(/\bthrow\b/g) || []).length, 3, 'throw 只剩条目查找错误 3 处');
 });
 
 test('vendored dsh-app-boot: 激活审计与 installFailLoud 均已变换 → marker + 注入体', () => {

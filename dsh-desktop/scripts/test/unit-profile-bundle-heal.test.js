@@ -2,10 +2,11 @@
 
 // profile-bundle-heal 单元测试：纯函数（bundlePatchRel / bundleEntryOf /
 // verifyBundleDir / packageDirUpward / writeFileAtomic）与两个源码变换
-// （app-boot / profile-boot）的幂等性、锚点匹配与语法有效性。变换针对
-// vendored dsh built 文件（只读）；产出写入临时 .mjs 用 node --check 验证。
+// （app-boot bundle 防护 / app-boot 用户补丁层防护）的幂等性、锚点匹配与语法
+// 有效性。变换针对 vendored dsh-app-boot built 文件（只读）；产出写入临时 .mjs
+// 用 node --check 验证。
 //
-// 注意：集成测试（真实 Electron 启动）会把这些防护实际应用到 node_modules，
+// 注意：集成测试（真实启动）会把这些防护实际应用到 node_modules，
 // 因此本测试对「文件已注入」与「文件未注入」两种状态都给出有意义断言：
 // 未注入 → 变换必须命中锚点并产出合法语法；已注入 → 变换必须识别标记并
 // 原样返回（幂等）。
@@ -19,7 +20,7 @@ const { execFileSync } = require('node:child_process');
 
 const {
   PROFILE_BUNDLE_GUARD_MARKER,
-  PROFILE_BOOT_GUARD_MARKER,
+  APP_BOOT_PATCH_LAYER_GUARD_MARKER,
   bundlePatchRel,
   bundleEntryOf,
   verifyBundleDir,
@@ -28,26 +29,17 @@ const {
   recoverManifestBundles,
   writeFileAtomic,
   applyAppBootBundleGuard,
-  applyProfileBootBundleGuard,
-  applyProfileBootHealGuard,
-  PROFILE_BOOT_HEAL_MARKER,
+  applyAppBootPatchLayerGuard,
 } = require('../../profile-bundle-heal');
+const { markers } = require('../lib/patch-adapters');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const appBootFile = path.join(repoRoot, 'node_modules', '@deepseek-ai', 'dsh-app-boot', 'lib', 'index.js');
-// 0.1.2-alpha.1：内核 profile-boot 产物文件名变化（BTzzdrGY 真实装配面 +
-// x7_BzdeW 纯 re-export 存根），且真实面可能已被 boot 链打过补丁——glob 出
-// 含装配面（loadOptionalPatches/loadUserPatchLayerSafe）的真实 bundle。
-function findProfileBootFile() {
-  const lib = path.join(repoRoot, 'node_modules', '@deepseek-ai', 'dsh', 'lib');
-  const files = fs.readdirSync(lib).filter((f) => /^profile-boot-.*\.js$/.test(f));
-  for (const f of files) {
-    const src = fs.readFileSync(path.join(lib, f), 'utf8');
-    if (src.includes('loadOptionalPatches') || src.includes('loadUserPatchLayerSafe')) return path.join(lib, f);
-  }
-  return files.length ? path.join(lib, files[0]) : null;
-}
-const profileBootFile = findProfileBootFile();
+
+// rc.2 换代：0.1.6 及更早的 profile-boot-*.js（homePatchPath / composeLive 形态）
+// 装配面已消失，原 applyProfileBootBundleGuard / applyProfileBootHealGuard 连同
+// 其 6 条用例一并退役；继任者是 readProfilePatches 层的 applyAppBootPatchLayerGuard
+// （注册表 id: profile-patch-layer-guard，order 130），本文件下方为其覆盖。
 
 function syntaxCheck(name, src) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pbg-unit-'));
@@ -203,56 +195,57 @@ test('recoverManifestBundles: 追加缺失登记并补回 dependencies，保留�
 });
 
 // 变换锚点合成源（必须与 profile-bundle-heal.js 内的锚点字节一致）。
-// 0.1.5-rc.1：逐个 bundle 严格装配的 `bundles.map(...)` 块从 loadProfile 移进
-// loadProfileDirectory(binName, dir, installAnchor, options)——该函数签名不再
-// 有 name 形参（上游以 basename(dir) 派生 profile 名），合成源按新宿主包裹。
-const SYNTHETIC_APP_LAYERS = [
-  '\tconst layers = bundles.map((packageName) => {',
-  '\t\tconst packageDir = resolveBundleDir(binName, packageName, installAnchor, dir);',
-  '\t\tconst declared = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")).dsh?.bundle?.patch;',
-  '\t\tif (declared === void 0) throw new Error(`${binName}: profile bundle ${JSON.stringify(packageName)} declares no dsh.bundle in its package.json`);',
-  '\t\tconst patchPath = join(packageDir, declared);',
-  '\t\treturn {',
-  '\t\t\tpackageName,',
-  '\t\t\tpackageDir,',
-  '\t\t\tpatchPath,',
-  '\t\t\tpatches: loadOverlayPatches(binName, patchPath)',
-  '\t\t};',
-  '\t});',
-].join('\n');
+// 0.2.0-rc.2：逐 bundle 的容错上游已原生实装（loadProfileDirectory 内
+// `for (const packageName of bundles) try {…} catch { skippedBundles.push(…) }` +
+// reportSkippedBundles），原 `bundles.map(...)` 严格装配块随之消失；本守卫只补
+// 仍留在 try 之外的两处——profile 自己的 manifest 读取、`dsh.profile.bundles`
+// 非数组。合成源按 rc.2 宿主包裹（签名里没有 name 形参，profile 名以
+// basename(dir) 派生）。
+const SYNTHETIC_APP_MANIFEST = '\tnormalizeShippedProfile(name, dir, readProfileManifest(binName, dir));';
+const SYNTHETIC_APP_BUNDLES = '\tconst bundles = readProfileManifest(binName, dir).dsh?.profile?.bundles ?? [];';
 const SYNTHETIC_APP_INSERT = 'function composeEntries(layers, warn = () => {}) {';
 
 test('applyAppBootBundleGuard: 合成源命中锚点并替换', () => {
-  // rc.1 宿主：调用点在 loadProfileDirectory(binName, dir, installAnchor, options) 内，
-  // 作用域没有 name 形参——注入的调用点必须传 basename(dir)，引用裸 name 会抛
-  // ReferenceError（每次启动崩溃，全仓最高优先级的真实回归）。
   const src = [
     'export const x = 1;',
     'function loadProfileDirectory(binName, dir, installAnchor, options = {}) {',
-    '\tconst manifest = readProfileManifest(binName, dir);',
-    '\tconst bundles = manifest.dsh?.profile?.bundles ?? [];',
-    SYNTHETIC_APP_LAYERS,
-    '\treturn { name: basename(dir), dir, layers };',
+    SYNTHETIC_APP_MANIFEST,
+    SYNTHETIC_APP_BUNDLES,
+    '\treturn { name: basename(dir), dir, bundles };',
     '}',
     SYNTHETIC_APP_INSERT,
     '\treturn null;',
     '}',
   ].join('\n');
   const out = applyAppBootBundleGuard(src);
-  assert.equal(out.changed, true);
+  assert.equal(out.changed, true, 'rc.2 两处严格读取锚点应命中');
   assert.ok(out.src.includes(PROFILE_BUNDLE_GUARD_MARKER), '应写入幂等标记');
-  assert.ok(out.src.includes('function loadProfileLayers(binName, name, dir, installAnchor)'), '应注入自愈装配');
-  assert.ok(out.src.includes('\tconst layers = loadProfileLayers(binName, basename(dir), dir, installAnchor);'), '调用点应替换（rc.1 宿主无 name 形参，以 basename(dir) 派生）');
-  assert.ok(!out.src.includes('const layers = loadProfileLayers(binName, name,'), '调用点不得引用裸 name（loadProfileDirectory 作用域内未定义）');
-  assert.ok(!out.src.includes(SYNTHETIC_APP_LAYERS), '严格装配代码块应整体移除');
+  assert.ok(out.src.includes('function loadProfileManifestSafe(binName, name, dir)'), '应注入 manifest 自愈读取');
+  assert.ok(out.src.includes('function loadProfileBundlesSafe(binName, name, dir)'), '应注入 bundles 非数组降级');
+  assert.ok(out.src.includes('\tnormalizeShippedProfile(name, dir, loadProfileManifestSafe(binName, name, dir));'),
+    'manifest 调用点应替换');
+  assert.ok(out.src.includes('\tconst bundles = loadProfileBundlesSafe(binName, basename(dir), dir);'),
+    'bundles 调用点应替换（宿主作用域无 name 形参，以 basename(dir) 派生）');
+  assert.ok(!out.src.includes('= loadProfileBundlesSafe(binName, name,'),
+    'bundles 调用点不得引用裸 name（loadProfileDirectory 作用域内未定义，会抛 ReferenceError）');
+  assert.ok(!out.src.includes(SYNTHETIC_APP_BUNDLES), '严格 bundles 读取应整体移除');
+  syntaxCheck('app-boot-synthetic', out.src);
   const again = applyAppBootBundleGuard(out.src);
   assert.equal(again.changed, false, '二次应用应为幂等空操作');
   assert.equal(again.src, out.src);
 });
 
 test('applyAppBootBundleGuard: 锚点缺失时原样返回', () => {
-  const src = 'export const x = 1;\nfunction composeEntries(layers, warn = () => {}) {\n  return null;\n}';
-  assert.deepEqual(applyAppBootBundleGuard(src), { changed: false, src });
+  assert.deepEqual(applyAppBootBundleGuard('export const x = 1;\n' + SYNTHETIC_APP_INSERT + '\n}'),
+    { changed: false, src: 'export const x = 1;\n' + SYNTHETIC_APP_INSERT + '\n}' },
+    '两个读取锚点全缺时必须零改写');
+  // 反证：只缺其一（manifest 在、bundles 被上游改写）同样不得半写——否则会留下
+  // 「manifest 已自愈、bundles 仍严格」的混合状态，用户看到的仍是启动失败页。
+  const halfMissing = 'function loadProfileDirectory(binName, dir) {\n' + SYNTHETIC_APP_MANIFEST + '\n}';
+  assert.deepEqual(applyAppBootBundleGuard(halfMissing), { changed: false, src: halfMissing });
+  const insertMissing = 'function loadProfileDirectory(binName, dir) {\n'
+    + SYNTHETIC_APP_MANIFEST + '\n' + SYNTHETIC_APP_BUNDLES + '\n}';
+  assert.deepEqual(applyAppBootBundleGuard(insertMissing), { changed: false, src: insertMissing });
   assert.deepEqual(applyAppBootBundleGuard(''), { changed: false, src: '' });
   assert.deepEqual(applyAppBootBundleGuard(null), { changed: false, src: null });
 });
@@ -273,87 +266,77 @@ test('applyAppBootBundleGuard: 真实 vendored 文件（两种状态均成立）
   }
 });
 
-test('applyProfileBootBundleGuard: 合成源命中全部调用点并替换', () => {
-  // 0.1.5-rc.1 合成源（与 profile-boot-Dk-7KqJc.js 逐字一致）：node:fs import 已
-  // 含 existsSync/mkdirSync/rmSync，export 别名重排并新增 initializeProfileFromDefault；
-  // 家级/profile 三处 loadOptionalPatches 调用点与 alpha.5 同字节。
-  const src = [
-    'import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";',
-    'const NAME = "dsh";',
-    '\tconst homePatches = loadOptionalPatches(NAME, homePatchPath()) ?? [];',
-    '\t\t...loadOptionalPatches(NAME, composed.profile.patchPath) ?? [],',
-    '\t\t...loadOptionalPatches(NAME, homePatchPath()) ?? [],',
-    'export { prepareProfile as a, initializeProfileFromDefault as i, PROFILE_ROOT_FILENAME as n, resolveTelemetryPatch as o, homePatchPath as r, runProfile as s, INSTALL_ANCHOR as t };',
+// ---------------------------------------------------------------------------
+// applyAppBootPatchLayerGuard（rc.2 继任 profile-boot 半边的补丁层防护）
+// ---------------------------------------------------------------------------
+
+// rc.2 dsh-app-boot/lib/index.js 的三处锚点（实测各 hits=1），逐字照抄。
+const PL_USER = '\t\t...initialProfile?.patches ?? loadOptionalPatches(binName, context.patchPath) ?? [],';
+const PL_HOME = '\t\t...loadOptionalPatches(binName, join(context.home, "cordis.patch.yml")) ?? [],';
+const PL_INSERT = 'function readProfilePatches(binName, context, initialProfile) {';
+
+function patchLayerFixture() {
+  return [
+    'async function composeProfile(context, initialProfile) {',
+    '\treturn {',
+    PL_USER,
+    PL_HOME,
+    '\t};',
+    '}',
+    PL_INSERT,
+    '\treturn loadOptionalPatches(binName, context.patchPath) ?? [];',
+    '}',
   ].join('\n');
-  const out = applyProfileBootBundleGuard(src);
-  assert.equal(out.changed, true);
-  assert.ok(out.src.includes(PROFILE_BOOT_GUARD_MARKER), '应写入幂等标记');
-  assert.ok(out.src.includes('function loadUserPatchLayerSafe(binName, file)'), '应注入自愈加载');
-  assert.ok(out.src.includes('import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";'), 'import 应扩充 readFileSync');
-  assert.ok(out.src.includes('\tconst homePatches = loadUserPatchLayerSafe(NAME, homePatchPath());'), 'composeProfile 调用点应替换');
-  assert.ok(out.src.includes('\t\t...loadUserPatchLayerSafe(NAME, composed.profile.patchPath),'), 'HMR profile 层调用点应替换');
-  assert.ok(out.src.includes('\t\t...loadUserPatchLayerSafe(NAME, homePatchPath()),'), 'HMR 家级层调用点应替换');
-  assert.ok(out.src.includes('export { prepareProfile as a, initializeProfileFromDefault as i, PROFILE_ROOT_FILENAME as n, resolveTelemetryPatch as o, homePatchPath as r, runProfile as s, INSTALL_ANCHOR as t };'), '原导出应保留');
-  assert.ok(!out.src.includes('loadOptionalPatches(NAME, homePatchPath()) ?? []'), '严格加载应移除');
-  assert.equal(applyProfileBootBundleGuard(out.src).changed, false, '二次应用应为幂等空操作');
+}
+
+test('applyAppBootPatchLayerGuard: 合成源命中三锚点并替换两处严格读取', () => {
+  const src = patchLayerFixture();
+  const out = applyAppBootPatchLayerGuard(src);
+  assert.equal(out.changed, true, '三锚点齐备时必须命中');
+  assert.ok(out.src.includes(APP_BOOT_PATCH_LAYER_GUARD_MARKER), '应注入 safeLoadUserPatchLayer');
+  assert.ok(out.src.includes('\t\t...initialProfile?.patches ?? safeLoadUserPatchLayer(binName, context.patchPath),'),
+    'profile 层调用点应换成自愈读取');
+  assert.ok(out.src.includes('\t\t...safeLoadUserPatchLayer(binName, join(context.home, "cordis.patch.yml")),'),
+    '家级层调用点应换成自愈读取');
+  assert.ok(!out.src.includes(PL_USER), 'profile 层的严格 ?? [] 形态应被移除');
+  assert.ok(!out.src.includes(PL_HOME), '家级层的严格 ?? [] 形态应被移除');
+  assert.ok(out.src.includes(PL_INSERT), 'readProfilePatches 定义行应原样保留');
+  syntaxCheck('patch-layer', out.src);
+  assert.equal(applyAppBootPatchLayerGuard(out.src).changed, false, '二次应用应为幂等空操作');
 });
 
-test('applyProfileBootBundleGuard: 任一锚点缺失时原样返回', () => {
-  const src = 'export const x = 1;';
-  assert.deepEqual(applyProfileBootBundleGuard(src), { changed: false, src });
-  assert.deepEqual(applyProfileBootBundleGuard(null), { changed: false, src: null });
-});
-
-test('applyProfileBootBundleGuard: 真实 vendored 文件（两种状态均成立）', () => {
-  const src = fs.readFileSync(profileBootFile, 'utf8');
-  const out = applyProfileBootBundleGuard(src);
-  if (src.includes(PROFILE_BOOT_GUARD_MARKER)) {
-    assert.equal(out.changed, false);
-    assert.equal(out.src, src);
-  } else {
-    assert.equal(out.changed, true, 'vendored profile-boot 锚点应命中（dsh 版本变更时需同步更新锚点）');
-    assert.ok(out.src.includes('function loadUserPatchLayerSafe'));
-    syntaxCheck('profile-boot', out.src);
-    assert.equal(applyProfileBootBundleGuard(out.src).changed, false);
+test('applyAppBootPatchLayerGuard: 三锚点逐一缺失都原样返回（反证判据起作用）', () => {
+  assert.deepEqual(applyAppBootPatchLayerGuard(null), { changed: false, src: null });
+  assert.deepEqual(applyAppBootPatchLayerGuard(''), { changed: false, src: '' });
+  // 每条锚点各自挖掉：任一失配都必须整体不动，绝不留下「半自愈」的混合读取。
+  for (const anchor of [PL_USER, PL_HOME, PL_INSERT]) {
+    const missing = patchLayerFixture().replace(anchor, '/* ANCHOR-REMOVED */');
+    const out = applyAppBootPatchLayerGuard(missing);
+    assert.deepEqual(out, { changed: false, src: missing }, `锚点 ${anchor.trim().slice(0, 40)} 缺失时不得改写`);
   }
+  // 已注入过（marker 命中）时同样零改写。
+  const once = applyAppBootPatchLayerGuard(patchLayerFixture()).src;
+  assert.deepEqual(applyAppBootPatchLayerGuard(once), { changed: false, src: once });
 });
 
-
-test('applyProfileBootHealGuard: 合成源命中 heal 调用并替换', () => {
-  // 0.1.5-rc.1 形态：composeProfile 内 await healProfilesModuleFallback({ installAnchor, profile })
-  // 四行调用（profile-boot-Dk-7KqJc.js:234 逐字一致），不再是 alpha.5 的单行直调。
-  const src = 'async function composeProfile(name) {\n'
-    + '\tawait healProfilesModuleFallback({\n'
-    + '\t\tinstallAnchor: INSTALL_ANCHOR,\n'
-    + '\t\tprofile\n'
-    + '\t});\n'
-    + '\treturn name;\n}';
-  const out = applyProfileBootHealGuard(src);
-  assert.equal(out.changed, true, 'heal 调用锚点应命中');
-  assert.ok(out.src.includes("try {"), '调用应包进 try/catch');
-  assert.ok(out.src.includes('\tawait healProfilesModuleFallback({'), 'try 块内应保留原 await 四行调用');
-  assert.ok(out.src.includes(PROFILE_BOOT_HEAL_MARKER), '幂等标记应写入');
-  assert.equal(applyProfileBootHealGuard(out.src).changed, false, '二次应用应为幂等空操作');
+test('applyAppBootPatchLayerGuard: 与补丁层另一处防护的标记互不为子串', () => {
+  // 两条防护都插在「读用户补丁层」附近；marker 互相包含会让先应用的那条把后一条
+  // 判成 already，第二层防护静默消失（profile-boot 时代踩过的名字约束）。
+  const other = markers.PROFILE_PATCH_GUARD_MARKER;
+  assert.ok(other && APP_BOOT_PATCH_LAYER_GUARD_MARKER.includes('safeLoadUserPatchLayer'));
+  assert.ok(!APP_BOOT_PATCH_LAYER_GUARD_MARKER.includes(other), '两 marker 不得互相包含');
+  assert.ok(!other.includes(APP_BOOT_PATCH_LAYER_GUARD_MARKER), '两 marker 不得互相包含');
 });
 
-test('applyProfileBootHealGuard: 无 heal 调用时静默原样返回（入口 bundle）', () => {
-  const src = 'export { runProfile as o } from "./x.js";';
-  assert.deepEqual(applyProfileBootHealGuard(src), { changed: false, src });
-  assert.deepEqual(applyProfileBootHealGuard(null), { changed: false, src: null });
-});
-
-test('applyProfileBootHealGuard: 真实 vendored 文件（两种状态均成立）', () => {
-  const src = fs.readFileSync(profileBootFile, 'utf8');
-  const out = applyProfileBootHealGuard(src);
-  if (src.includes(PROFILE_BOOT_HEAL_MARKER)) {
+test('applyAppBootPatchLayerGuard: 真实 vendored 文件（两种状态均成立）', () => {
+  const src = fs.readFileSync(appBootFile, 'utf8');
+  const out = applyAppBootPatchLayerGuard(src);
+  if (src.includes(APP_BOOT_PATCH_LAYER_GUARD_MARKER)) {
     assert.equal(out.changed, false);
     assert.equal(out.src, src);
-  } else if (!src.includes('\tawait healProfilesModuleFallback({')) {
-    assert.equal(out.changed, false, '入口 bundle 无 heal 调用应静默（rc.1 四行 await 形态）');
   } else {
-    assert.equal(out.changed, true, 'vendored profile-boot heal 锚点应命中（dsh 版本变更时需同步更新锚点）');
-    assert.ok(out.src.includes(PROFILE_BOOT_HEAL_MARKER));
-    syntaxCheck('profile-boot-heal', out.src);
-    assert.equal(applyProfileBootHealGuard(out.src).changed, false);
+    assert.equal(out.changed, true, 'vendored app-boot 补丁层锚点应命中（dsh 版本变更时需同步更新锚点）');
+    syntaxCheck('patch-layer-real', out.src);
+    assert.equal(applyAppBootPatchLayerGuard(out.src).changed, false);
   }
 });

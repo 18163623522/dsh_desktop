@@ -4,14 +4,15 @@
 //
 // v0.6.0 用户反馈「本轮运行失败 Cannot read properties of undefined (reading 'some')」。
 // 真凶：dsh-llm 的 contentHasImage 是所有图片策略（capability gating / text-only
-// serialization / compaction survey）共用的唯一递归图片遍历，它对 tool-result 块
-// 递归调用 contentHasImage(block.content)；当某个 tool-result 块的 content 为非数组
-// （undefined）时，裸 content.some 即抛 "Cannot read properties of undefined
-// (reading 'some')"，经 adapterStream → turn/end 冒泡成整轮失败。补丁在函数头加
+// serialization / compaction survey）共用的图片遍历，content 为非数组（undefined）时
+// 裸 content.some 即抛 "Cannot read properties of undefined (reading 'some')"，
+// 经 adapterStream → turn/end 冒泡成整轮失败。补丁在函数头加
 // `if (!Array.isArray(content)) return false;`（非数组天然不含图片）。
+// 0.2.0-rc.2：上游删了 tool-result 递归，函数体只剩一层 block 扫描——本补丁只加
+// 前置守卫，判定面随上游，不补回递归。
 //
 // 覆盖：
-//   1. 锚点命中 pristine 源（vendored alpha.5 dsh-llm tarball 的 lib/index.js）→ changed；
+//   1. 锚点命中 pristine 源（vendored kernel-pin 版本 dsh-llm tarball 的 lib/index.js）→ changed；
 //   2. transform 产物 node --check 可解析（守卫保持语法完整）；
 //   3. 幂等（二遍 already）；
 //   4. 语义：函数头 Array.isArray 守卫在位、原 return 行保留、marker 在位；
@@ -62,16 +63,17 @@ const nodeCheck = (src) => {
   finally { fs.rmSync(f, { force: true }); }
 };
 
-test('1-4. content-has-image-guard 命中 vendored alpha.5 pristine → changed + 语义 + node --check + 幂等', () => {
+test('1-4. content-has-image-guard 命中 vendored rc.2 pristine → changed + 语义 + node --check + 幂等', () => {
   const file = extractPristineIndex();
   const pristine = fs.readFileSync(file, 'utf8');
   const out = transformContentHasImageGuard(pristine, file);
-  assert.equal(out.status, 'changed', 'pristine alpha.5 应 changed（锚点若漂移即回归）');
+  assert.equal(out.status, 'changed', 'pristine rc.2 应 changed（锚点若漂移即回归）');
   assert.equal(typeof out.src, 'string');
 
   // 函数头守卫在位；原 return 行保留（仅前置守卫，不改判定语义）。
+  // 0.2.0-rc.2：上游把 tool-result 递归删了，return 行只剩一层 block 扫描。
   assert.match(out.src, /function contentHasImage\(content\) \{\n\tif \(!Array\.isArray\(content\)\) return false; \/\/ [^\n]*contentHasImage non-array guard/);
-  assert.match(out.src, /\treturn content\.some\(\(block\) => block\.type === "image" \|\| block\.type === "tool-result" && contentHasImage\(block\.content\)\);/);
+  assert.match(out.src, /\treturn content\.some\(\(block\) => block\.type === "image"\);/);
 
   // marker 在位（already 判定源）
   assert.ok(out.src.includes(MARKER), '产物应含 CONTENT_HAS_IMAGE_GUARD_MARKER');
@@ -101,10 +103,10 @@ test('5. 行为：守卫后 contentHasImage 对 undefined / 嵌套 tool-result.c
   // 正常数组路径判定不变。
   assert.equal(ch([{ type: 'text', text: 'x' }]), false);
   assert.equal(ch([{ type: 'image' }]), true);
-  // tool-result 递归：content undefined → 递归守卫返回 false，不崩。
-  assert.equal(ch([{ type: 'tool-result', content: undefined }]), false);
-  // tool-result 递归含图片 → true。
-  assert.equal(ch([{ type: 'tool-result', content: [{ type: 'image' }] }]), true);
+  // tool-result 递归：0.2.0-rc.2 上游已删掉递归（只扫一层 block）。本补丁的职责
+  // 仍是「非数组不裸抛」，这里锁住当前语义而不是旧递归。
+  assert.equal(ch([{ type: 'tool-result', content: undefined }]), false, 'tool-result content undefined → false，绝不裸抛');
+  assert.equal(ch([{ type: 'tool-result', content: [{ type: 'image' }] }]), false, 'rc.2 不再递归 tool-result.content');
 });
 
 test('6. 不误伤：锚点缺失（版本漂移）→ anchor-missing（非静默错配）', () => {

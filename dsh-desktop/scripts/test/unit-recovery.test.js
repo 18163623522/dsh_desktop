@@ -287,7 +287,8 @@ test('挂起：宽限期内恢复响应则取消；持续无响应则强制终�
   win2.webContents.emit('did-finish-load');
   await tick(80); // 稳定期结束
   win2.webContents.emit('unresponsive');
-  await tick(200); // 30ms 宽限 → 强制终结 → 重载 → 30ms 稳定
+  // 同上：等整链（30ms 宽限 → 强制终结 → 重载 → 稳定期清零）走完，不猜墙钟。
+  await waitFor(() => logs2.some((l) => l.includes('界面持续无响应')) && r2.stateOf(win2).failures === 0);
   assert.ok(logs2.some((l) => l.includes('界面持续无响应')), '宽限期到应强制终结');
   assert.ok(logs2.some((l) => l.includes('渲染进程异常退出')), '强制终结应产生崩溃事件');
   assert.strictEqual(r2.stateOf(win2).failures, 0, '恢复成功后计数清零');
@@ -307,7 +308,10 @@ test('心跳兜底：失联视为挂起，恢复心跳则取消', async () => {
   await tick(300); // 超过 HEARTBEAT_MISS_MS=200
   r.checkHeartbeats();
   assert.ok(logs.some((l) => l.includes('心跳丢失')), '心跳超时应判定为挂起');
-  await tick(150);
+  // 「强制终结 → 重载 → 稳定期清零」整链走完才收工。原先写死 tick(150)：全量套件
+  // 并发时定时器被饿，链路没走完 → failures 还是 1 → 假红（隔离跑 ~780ms 稳过，
+  // 满载跑红过）。改成等真实状态收敛。
+  await waitFor(() => logs.some((l) => l.includes('界面持续无响应')) && r.stateOf(win).failures === 0);
   assert.ok(logs.some((l) => l.includes('界面持续无响应')), '心跳失联最终强制恢复');
   assert.strictEqual(r.stateOf(win).failures, 0, '强制恢复后应回归健康');
 

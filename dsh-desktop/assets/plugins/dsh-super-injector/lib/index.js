@@ -2097,9 +2097,12 @@ appendFileSync(patchFile, `\n# super-injector heal ${Date.now()}\n`);
      * 坏 client 插件在 registry → 新会话恢复 → apply 失败 → HARNESS 启动失败）。
      * 返回问题列表（空 = 健康）。lib 与 src 双检查（只有 lib 无 src 不绕过）。
      * ⚠️ slot 白名单（2026-08-14 dsh-external-plugins 事件教训）：注册的 slot 名
-     * 必须位于已知合法集合内——早期只认 conversation.view，导致 settings.plugin.item
-     * 等设置页卡片被误判为坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。 */
-    const KNOWN_SLOTS = ['conversation.view', 'settings.plugin.item', 'settings.plugins.tab', 'settings.section', 'settings.general.item', 'conversation.session.header.actions', 'conversation.session.header.utilities', 'conversation.input.dock', 'conversation.composer.dock', 'sidebar.footer.action', 'shell.overlay'];
+     * 必须位于已知合法集合内——早期只认 conversation.view，导致设置页卡片被误判为
+     * 坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。
+     * 0.2.0-rc.2 起移除 `settings.plugin.item`（上游不再有该槽，注册它的 UI 永不
+     * 挂载），设置页卡片的合法落点只剩 `settings.plugins.tab` / `settings.section`
+     * / `settings.general.item`。 */
+    const KNOWN_SLOTS = ['conversation.view', 'settings.plugins.tab', 'settings.section', 'settings.general.item', 'conversation.session.header.actions', 'conversation.session.header.utilities', 'conversation.input.dock', 'conversation.composer.dock', 'sidebar.footer.action', 'shell.overlay'];
     const SLOT_ALT = KNOWN_SLOTS.map((s) => s.replace(/\./g, '\\.')).join('|');
     const REGISTER_NAME = new RegExp(`register\\(\\{[\\s\\S]*?name:\\s*['"](${SLOT_ALT})['"]`);
     function clientSkeletonProblems(base) {
@@ -2923,8 +2926,8 @@ if (args.check)
                     if (!/export const inject\s*=\s*\[[^\]]*'slots'/.test(clientSrc)) {
                         problems.push("缺 export const inject = ['slots']（cordis 服务注入声明——apply 用 ctx.slots 必须声明）");
                     }
-                    if (!/register\(\{[\s\S]*?name:\s*['"](?:conversation\.view|settings\.plugin\.item|settings\.plugins\.tab|settings\.section|settings\.general\.item)['"]/.test(clientSrc)) {
-                        problems.push("slots.register 缺合法 name（应为已知 slot：conversation.view / settings.plugin.item / settings.plugins.tab / settings.section / settings.general.item——缺了报 slot undefined is not declared）");
+                    if (!/register\(\{[\s\S]*?name:\s*['"](?:conversation\.view|settings\.plugins\.tab|settings\.section|settings\.general\.item)['"]/.test(clientSrc)) {
+                        problems.push("slots.register 缺合法 name（应为已知 slot：conversation.view / settings.plugins.tab / settings.section / settings.general.item——缺了报 slot undefined is not declared；0.2.0-rc.2 已移除 settings.plugin.item）");
                     }
                     if (problems.length > 0) {
                         return 'ERROR: client 骨架校验失败（' + pkgName + '）：\n- ' + problems.join('\n- ')

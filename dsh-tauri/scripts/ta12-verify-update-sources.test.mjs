@@ -12,7 +12,7 @@
 //   · 边车格式坏 → 1；边车哈希 != digest → 1
 //   · HEAD content-length != API size → 1（GitHub 源与 Gitee 镜像各一）
 //   · Gitee API 500 → 1；纯 WARN 场景（缺未超限资产/缺边车/无边车）→ 0
-//   · >100MB 资产 Gitee 缺失属预期（不 WARN）
+//   · 超限（>100MB）资产分片镜像：完整连续 + Σ==GitHub size → 0；无分片/断号/某片截断 → 1
 //   · --test 自检 → 0；--help → 0；未知参数 → 1
 // 运行：node --test dsh-tauri/scripts/ta12-verify-update-sources.test.mjs
 // 依赖：openssl（仅测试临时目录，不触碰系统信任库）。
@@ -100,6 +100,18 @@ const geeAssets = () => [
 // ---------------------------------------------------------------------------
 // 子进程驱动
 // ---------------------------------------------------------------------------
+// ⚠ 已知偶发（实测 2026-10-06）：FAIL 场景下被测子进程约 1/36 以 3221226505
+// （STATUS_STACK_BUFFER_OVERRUN，Windows 的 abort/fastfail）终结，表现成
+// 「3221226505 !== 1」这类看不懂的假红。已排除三种解释：
+//   · 不是 harness —— pipe+timeout / 纯 pipe / stdio 落文件三种形态都会中，与
+//     spawnSync 的 timeout、管道都无关；
+//   · 不是场景绑定 —— 命中过的用例在「>100MB 分片」「HEAD 漂移」「digest 不符」
+//     之间漂移，健康场景（exit 0）36/36 从不复现，只有含 FAIL 的运行会；
+//   · 不是外部杀进程 —— Application 日志近 3h 零条 node.exe 崩溃记录。
+// 崩点固定在「最后一条 [OK]/[FAIL] 打印之后、== 汇总 == 之前」，即 main() 末尾
+// `process.exit(code)` 拆 CONNECT 隧道 socket 的收尾路径（verify-update-sources.mjs:442）。
+// 用例保持严格（不把崩溃当通过）；真修要显式销毁隧道 socket，但那会给这个 dev-only
+// 脚本引入挂等风险，暂记为已知项。
 async function runVerify(args = []) {
   const s = await ensureStack();
   const env = {
@@ -224,25 +236,79 @@ test('行为级 WARN 分类：缺未超限资产/缺边车/无边车 → exit 0 
   assert.ok(r.out.includes('结论: 通过（含警告'), r.out);
 });
 
-test('行为级：>100MB 资产 Gitee 缺失属预期（不 WARN 不 FAIL）', async () => {
-  await ensureStack();
-  const bigUrl = 'https://objects.githubusercontent.com/gh/big.deb';
-  setState({
+// 超限资产（>GITEE_FILE_LIMIT=100MB）在 Gitee 侧**必须**以完整连续的 `<名>.partN`
+// 分片镜像：GitHub 不可达的用户只能靠这套分片更新，所以 verify-update-sources.mjs
+// :307 起把「无分片 / 断号 / Σ 与 GitHub size 不符」全判 FAIL（硬错，exit 1）。
+// 旧用例停在 v0.5.2 的「缺失属预期不 FAIL」契约上——判据改了而用例没跟着改，
+// 于是它对现在的守卫只会假红，且永远证明不了分片链是通的。
+// 下面 1 正证 + 3 反证：每条反证各拆掉判据的一项（缺片 / 断号 / 单片截断），
+// 结论必须随之翻成 exit 1，否则正证的绿没有意义。
+const BIG_SIZE = 122_865_758;          // >100MB → expectedPartCount = ceil(1.17) = 2
+const PART1_SIZE = 83_886_080;         // 80MiB（mirror-gitee 的切片上限）
+const PART2_SIZE = BIG_SIZE - PART1_SIZE;
+const BIG_URL = 'https://objects.githubusercontent.com/gh/big.deb';
+const GEE_SIDE = 'https://gitee.com/att/big.deb.sha256';
+
+/** 超限资产场景：parts 控制 Gitee 侧分片形态，partSizes 用来注入「某片被截断」。 */
+function bigAssetState({ parts = ['part1', 'part2'], partSizes = { part1: PART1_SIZE, part2: PART2_SIZE } } = {}) {
+  const geeAssets = [{ name: 'big.deb.sha256', url: GEE_SIDE }];
+  const assetMap = {
+    [BIG_URL]: { contentLength: BIG_SIZE },
+    [BIG_URL + '.sha256']: { body: `${HASH_A}  big.deb\n` },
+    [GEE_SIDE]: { body: `${HASH_A}  big.deb\n` },
+  };
+  for (const p of parts) {
+    assert.ok(partSizes[p] != null, `夹具未声明 ${p} 的大小（会静默按 0 计 Σ，用例假绿）`);
+    const url = `https://gitee.com/att/big.deb.${p}`;
+    geeAssets.push({ name: `big.deb.${p}`, url });
+    assetMap[url] = { contentLength: partSizes[p] };
+  }
+  return {
     gh: ghRelease('v0.5.2', [
-      { name: 'big.deb', size: 122_865_758, url: bigUrl, digest: `sha256:${HASH_A}` },
-      { name: 'big.deb.sha256', size: 71, url: bigUrl + '.sha256' },
+      { name: 'big.deb', size: BIG_SIZE, url: BIG_URL, digest: `sha256:${HASH_A}` },
+      { name: 'big.deb.sha256', size: 71, url: BIG_URL + '.sha256' },
     ]),
-    gee: geeRelease('v0.5.2', [{ name: 'big.deb.sha256', url: 'https://gitee.com/att/big.deb.sha256' }]),
-    assets: {
-      [bigUrl]: { contentLength: 122_865_758 },
-      [bigUrl + '.sha256']: { body: `${HASH_A}  big.deb\n` },
-      'https://gitee.com/att/big.deb.sha256': { body: `${HASH_A}  big.deb\n` },
-    },
-  });
+    gee: geeRelease('v0.5.2', geeAssets),
+    assets: assetMap,
+  };
+}
+
+test('行为级正证：超限资产完整连续分片 + Σ==GitHub size → exit 0、零 FAIL 零 WARN', async () => {
+  await ensureStack();
+  setState(bigAssetState());
   const r = await runVerify();
   assert.equal(r.code, 0, r.out);
-  assert.equal(countTag(r.out, 'WARN'), 0, '超限缺失属预期: ' + r.out);
-  assert.ok(r.out.includes('超 100MB 限，预期缺失'), r.out);
+  assert.equal(countTag(r.out, 'FAIL'), 0, '分片齐全不得判硬错: ' + r.out);
+  assert.equal(countTag(r.out, 'WARN'), 0, '分片齐全不得判 WARN: ' + r.out);
+  assert.ok(r.out.includes('分片镜像 x2（≥下限 2 片'), r.out);
+  assert.ok(r.out.includes(`Σ=${BIG_SIZE} == GitHub size`), '逐片 HEAD 求和必须核对通过: ' + r.out);
+});
+
+test('行为级反证：超限资产无任何 .partN 分片 → exit 1 且点名缺失（旧契约「属预期」已废）', async () => {
+  await ensureStack();
+  setState(bigAssetState({ parts: [] }));
+  const r = await runVerify();
+  assert.equal(r.code, 1, r.out);
+  assert.ok(r.out.includes('Gitee 缺失超限资产且无 .partN 分片: big.deb'), r.out);
+});
+
+test('行为级反证：分片断号（part1+part3，缺 part2）→ exit 1 且报不连续', async () => {
+  await ensureStack();
+  setState(bigAssetState({
+    parts: ['part1', 'part3'],
+    partSizes: { part1: PART1_SIZE, part3: PART2_SIZE },
+  }));
+  const r = await runVerify();
+  assert.equal(r.code, 1, r.out);
+  assert.ok(r.out.includes('Gitee 分片不连续: big.deb 片号=[1,3]'), r.out);
+});
+
+test('行为级反证：某片被截断（Σ != GitHub size）→ exit 1 且报汇总不符', async () => {
+  await ensureStack();
+  setState(bigAssetState({ partSizes: { part1: PART1_SIZE, part2: PART2_SIZE - 4096 } }));
+  const r = await runVerify();
+  assert.equal(r.code, 1, r.out);
+  assert.ok(r.out.includes(`Σ=${BIG_SIZE - 4096} != GitHub size=${BIG_SIZE}`), r.out);
 });
 
 test('CLI 面：--test 自检 → 0；--help → 0；未知参数 → 1（无需网络）', () => {

@@ -11,7 +11,6 @@ const path = require('node:path');
 
 const {
   transformProfilePatchGuard,
-  transformSettingsSectionGuard,
   transformPluginInventoryTabMergeFix,
   transformFlashFix,
 } = require('../lib/patch-adapters');
@@ -34,21 +33,9 @@ test('transformProfilePatchGuard：匹配 / 已应用 / 失配三态', () => {
   assert.equal(miss.status, 'anchor-missing');
 });
 
-const SETTINGS_MARKER = 'dsh-desktop guard: an invalid stored section must not brick';
-// 0.1.2-alpha.2：register 调用点在 provider 类方法 installSection 内（this.register），
-// 与 patch-adapters 重靶后锚点同源（sctx.settings.register 老形态已随内核换代失效）。
-const SETTINGS_ANCHOR = '\t\tconst scope = this.register(ns, schema, {';
-
-test('transformSettingsSectionGuard：匹配 / 已应用 / 失配三态', () => {
-  const src = '\t\tconst scope = this.register(ns, schema, {\n\t\t\tbase: entry,\n\t\t\t...hooks.validate === void 0 ? {} : { validate: hooks.validate }\n\t\t});\n\t\thooks.setSource(() => scope.get());';
-  const changed = transformSettingsSectionGuard(src, 't.js');
-  assert.equal(changed.status, 'changed');
-  assert.ok(changed.src.includes(SETTINGS_MARKER));
-  assert.ok(changed.src.includes('let scope;'));
-  assert.equal(transformSettingsSectionGuard('// ' + SETTINGS_MARKER, 't.js').status, 'already');
-  const miss = transformSettingsSectionGuard('export const x = 1;', 't.js');
-  assert.equal(miss.status, 'anchor-missing');
-});
+// settings-section-guard 已随 0.2.0-rc.2 退役并从 patch-adapters 删除：其锚点
+// `const scope = this.register(ns, schema, {`（provider 方法 installSection 内的
+// 注册调用点）在 rc.2 全内核 0 命中，插入点不存在 ⇒ 无实现可测，用例随之撤除。
 
 const TAB_MARKER = 'dsh-desktop fix: hide inventory tab';
 const TAB_OLD = 'tabs = ctx.slots.entries("settings.plugins.tab").map((entry) => ({';

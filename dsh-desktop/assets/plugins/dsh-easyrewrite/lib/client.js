@@ -1314,7 +1314,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-    // ---------- 设置卡片（设置 → 插件 → 插件配置；中英日三语） ----------
+    // ---------- 设置页组件（设置 → 插件 → EasyRewrite 标签页；中英日三语） ----------
     var SETTINGS_I18N = {
       zh: {
         title: "EasyRewrite",
@@ -1624,7 +1624,7 @@ window.__ModuleLoader__.load({
       );
       return SETTINGS_I18N[active] || SETTINGS_I18N.zh;
     }
-    /** 设置卡片：注册进 settings.plugin.item（设置 → 插件 → 插件配置）。 */
+    /** 设置页组件：0.2.0-rc.2 起注册进 settings.plugins.tab（设置 → 插件 → 独立标签页）。 */
     function EasyRewriteSettingsCard(props) {
       var L = useUILocaleDict();
       var openState = React.useState(false);
@@ -4017,13 +4017,15 @@ window.__ModuleLoader__.load({
           }, RecallBanner);
         });
         if (typeof d3 === "function") disposers.push(d3);
-        // 设置卡片（设置 → 插件 → 插件配置）
-        var d4 = ctx.slots.inject("settings.plugin.item", function () {
+        // 设置页入口：0.2.0-rc.2 移除了 `settings.plugin.item` 槽（上游只保留
+        // `settings.plugins.tab`），注册进内核未声明的槽会让 SlotCore.register
+        // 必抛、该 UI 静默永不挂载——因此改为在「设置 → 插件」下独占一个标签页。
+        var d4 = ctx.slots.inject("settings.plugins.tab", function () {
           return ctx.slots.register({
-            name: "settings.plugin.item",
-            key: "dsh-easyrewrite",
+            name: "settings.plugins.tab",
             id: "dsh-easyrewrite",
             order: 30,
+            label: "EasyRewrite",
             inject: function () {
               return {
                 openSession: function (id) { ctx.sessions.open(id); },

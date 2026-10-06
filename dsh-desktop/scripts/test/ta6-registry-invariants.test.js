@@ -13,7 +13,8 @@
 //      某个路径常量覆盖（白名单化记录既有内联漂移，新漂移即红）；
 //   E. order 全局唯一、组内升序、组间依赖序（requires / 已知补丁间依赖的
 //      目标 order 更小）；
-//   F. cli:true 数量与既有断言一致（11）；failPolicy ∈ {warn,degrade}
+//   F. cli:true 数量恰为 26（哨兵随换代更新，理由逐条记在用例注释里）；
+//      failPolicy ∈ {warn,degrade}
 //      （注意：治理任务书写的是 {warn,error}，registry 实际词表是
 //      {warn,degrade,fatal(仅注释)}，此处按实际词表断言并作为缺陷记录）；
 //   G. group 一致性：group ∈ {runtime,guard,package}，guard 组内
@@ -51,7 +52,8 @@ const IMPL_SOURCES = [
 /** 既有「内联 pkgRel」白名单：registry 里未走 patch-target-resolver 常量的
  * 历史漂移（缺陷记录：路径常量未收口，加新条目到此白名单 = 掩盖漂移）。 */
 const INLINE_PKG_REL_SPEC_IDS = new Set([
-  'settings-section-guard',
+  // settings-section-guard 已随 0.2.0-rc.2 退役（`this.register(ns, schema, {` 调用点
+  // 全内核 0 命中，插入点不存在），其内联 pkgRel 条目随之从白名单消失。
   // workspace-search-rail-fix 已收口到 WORKSPACE_PKG_REL（K25），移出白名单。
   'credentials-initial-retry',
   // credentials-absent-guidance 的内联 pkgRel 与 EXPOSE_PKG_REL 同值，视为已覆盖。
@@ -83,7 +85,8 @@ test('A. file spec transform 均为函数且来自收口导出（无内联孤儿
   const adapterExports = new Set(Object.values(adapters).filter((v) => typeof v === 'function'));
   const loaderExports = new Set(Object.values(loaderIsolation).filter((v) => typeof v === 'function'));
   const fileSpecs = PATCH_SPECS.filter((s) => s.kind === 'file');
-  assert.ok(fileSpecs.length >= 28, `file spec 应有 28 个，得 ${fileSpecs.length}`);
+  // 44 = rc.2 重靶后的 file 型规格数（64 项总盘中 root 15 + file 44 = 59，另见 E）。
+  assert.equal(fileSpecs.length, 44, `file spec 应有 44 个，得 ${fileSpecs.length}`);
   for (const spec of fileSpecs) {
     assert.equal(typeof spec.transform, 'function', `${spec.id} 缺 transform`);
     assert.ok(
@@ -96,7 +99,10 @@ test('A. file spec transform 均为函数且来自收口导出（无内联孤儿
 test('B. root spec apply ∈ rootAppliers 值集（绕过收口即红）', () => {
   const appliers = new Set(Object.values(adapters.rootAppliers));
   const rootSpecs = PATCH_SPECS.filter((s) => s.kind === 'root');
-  assert.ok(rootSpecs.length >= 8);
+  // 15 = rc.2 重靶后的 root 型规格数（atomic-write-orphan-lock / model-image-input
+  // 两条应用器已随补丁退役，其 rootAppliers 接线同步摘除——死接线会被下面的
+  // 双向断言当场点名）。
+  assert.equal(rootSpecs.length, 15, `root spec 应有 15 个，得 ${rootSpecs.length}`);
   for (const spec of rootSpecs) {
     assert.equal(typeof spec.apply, 'function', `${spec.id} 缺 apply`);
     assert.ok(appliers.has(spec.apply), `${spec.id} 的 apply 不是 rootAppliers 成员`);
@@ -130,7 +136,17 @@ test('C. marker 单一数据源 + marker 出现在 transform 实现源码文本�
     // 已知多形态常量：v1/v2 世代 marker 不再做任何 spec 的幂等判定，只供
     // 「在野旧副本」的识别/升级通道与逆运算登记使用
     // （v2 = 基础 marker + ' (v2)'，v3 = 基础 marker + ' (v3)'）。
-    const knownUnused = new Set(['SLOT_ERROR_ISOLATE_MARKER', 'SESSION_LOAD_GRACEFUL_MARKER', 'SESSION_LOAD_GRACEFUL_MARKER_V2']);
+    // LOADER_TREE_ISOLATION_MARKER 同属此类：loader-tree-isolation 规格已随
+    // 0.2.0-rc.2 退役（cordis-plugin-loader 1.0.5 自己逐条目隔离，插入点消失），
+    // 但 transformLoaderTreeIsolation 与它的 marker 仍作为休眠层保留在
+    // loader-isolation 导出面（unit-loader-isolation-deep 逐字节核着它），
+    // adapters.markers 靠 spread 同源带出，故无 spec 引用是预期形态。
+    const knownUnused = new Set([
+      'SLOT_ERROR_ISOLATE_MARKER',
+      'SESSION_LOAD_GRACEFUL_MARKER',
+      'SESSION_LOAD_GRACEFUL_MARKER_V2',
+      'LOADER_TREE_ISOLATION_MARKER',
+    ]);
     if (!used) assert.ok(knownUnused.has(name), `marker ${name} 无任何 spec 引用`);
   }
 });
@@ -156,53 +172,31 @@ test('D. pkgRel/pkgRels 被 patch-target-resolver 常量覆盖（白名单外新
 });
 
 test('E. order 全局唯一、组内升序、补丁间依赖序成立', () => {
-  // 53 = 52（上一基线）+ 1 项新增（content-has-image-guard：v0.6.0「本轮运行失败
-  // Cannot read properties of undefined (reading 'some')」，dsh-llm contentHasImage 对
-  // tool-result 递归时 content 非数组裸崩，函数头加 Array.isArray 守卫）。
-  // 52 = 51（上一基线）+ 1 项重新登记（image-send-fix：0.1.2-alpha.1 退役后，
-  // 按 alpha.5 重写后的 SessionCommandController.prompt 重锚，一条 transform 同时
-  // 兜住识图自动转述失效（故障②）与 prompt content undefined 裸崩（故障①）；
-  // 其 transform 自 alpha.1 起一直是未登记死代码，此次为重锚后重新纳册）。
-  // 51 = 50（上一基线）+ 1 项新增（workspace-chip-label-hold：0.1.2-alpha.5
-  // 「选择工作文件夹时跳闪」，chipTitle 的 workspaces.phase gate 重靶）。
-  // 50 = 51（上一基线）− 1 项退役（workspace-search-rail-fix：alpha.2 上游
-  // 已原生实现同款守卫，pristine :L1991 实证）。
-  // 54 = 53（上一基线）+ 1 项新增（history-page-size：历史对话分页容量 50→200，
-  // 直击「历史仅加载约三分之一 / 上滑到顶仍加载不全」主诉之一；两靶 session-
-  // controller lib/client.js 调用点 + lib/index.js DEFAULT_MAX_MESSAGES）。
-  // 55 = 54（上一基线）+ 1 项新增（journal-prepend-continuity：gateway/lib/client.js
-  // RemoteJournalStream.prepend() 不连续历史页断头分支删除，历史可持续向更早处翻页）。
-  // 56 = 55（上一基线）+ 1 项新增（chat-scroll-autoload-older：dsh-client-ui-chat ChatView
-  // IntersectionObserver 顶部哨兵，滚到顶自动 loadOlder，不再需手动点「加载更早」）。
-  // 57 = 56（上一基线）+ 1 项新增（conversation-assembly-resilience：dsh-client-ui-conversation
-  // BoundConversation.accept 装配抛错改为安全重建 + 去重可见告警，直击「吞消息」）。
-  // 58 = 57（上一基线）+ 1 项新增（model-image-input：模型设置页逐模型「支持图片
-  // 输入」勾选——手声明路由不写 input 时 pi-ai 恒回落 ["text"]，多模态模型被当
-  // 文本模型拒收图片；靶 dsh-client-ui-settings-models/lib/client.js，与
-  // settings-models-resilience 同靶不同区段）。
-  // 60 = 62（0.6.3 基线）− 2 项退役：preset-seat-fix（0.1.5-rc.1 上游原生修复
-  // busy 复位）与 token-meter-clamp（0.1.5-rc.1 新公式恒非负）已从 boot 编排退役。
-  // workspace-pin（侧栏工作区 ⋯ 菜单「置顶到列表顶部」，可多选降序压顶、
-  // localStorage 持久化，order 215，靶 dsh-client-ui-workspace）仍在册。
-  // 61 = 60（上一基线）+ 1 项新增（released-v0-history-recovery，order 402，靶
-  // dsh-session-format-v0-to-v1/lib/index.js：frozen released-v0 编解码器把清单外
-  // 载荷成员整条拒载，老会话（第三方压缩插件的 tier/kernelBlockId/parentBlockIds/
-  // directMessageIds/effectiveMessageIds、早期 permission/preset.origin、
-  // subagent/descriptor version:2）读不回历史；只扩准入清单、成员原样保留）。
-  // 62 = 61（上一基线）+ 1 项新增（pi-ai-responses-tool-name-sanitize，order 335，
-  // 靶 @earendil-works/pi-ai/dist/api/openai-responses-shared.js —— 非闭包靶包，与
-  // pi-ai-tool-schema-sanitize 同族：Responses 三条路由共用的工具序列化/历史回放/
-  // 流式槽位零清洗，cardian.* 带点号名上 wire 即被 OpenAI 兼容网关按
-  // ^[a-zA-Z0-9_-]+$ 拒为 400 invalid_value，整轮失败）。
-  // 63 = 62（上一基线）+ 1 项新增（pi-ai-tool-name-wire，order 336，靶
-  // @deepseek-ai/dsh-llm-pi-ai/lib/index.js —— 内核 ↔ pi-ai 唯一交界，出站 toolsOf()
-  // 洗名 + 回程两处 case "tool-call" 还原，一处覆盖全部 provider（OpenAI/Bedrock/
-  // Gemini/Mistral），补上逐适配器两条之外的缺口）。
-  // 64 = 63（上一基线）+ 1 项新增（pi-ai-quota-not-retryable，order 337，靶
-  // @earendil-works/pi-ai/dist/utils/provider-retry.js —— isRetryableProviderError
-  // 把 429 一律当可重试，而 OpenAI 兼容渠道的 insufficient_quota 同为 429 却是
-  // 终态；补丁识别配额耗尽即返回不可重试，x-should-retry 头仍优先）。
-  assert.equal(PATCH_SPECS.length, 64, 'spec 总数应为 64');
+  // —— 基线沿革（只记变化量，逐条理由见 patch-registry 头部与各 spec 上方注释）——
+  // 53 … 64（0.6.0→0.6.4 逐条新增：content-has-image-guard / image-send-fix 重新
+  //   登记 / workspace-chip-label-hold / history-page-size / journal-prepend-continuity
+  //   / chat-scroll-autoload-older / conversation-assembly-resilience / model-image-input
+  //   / released-v0-history-recovery / pi-ai-responses-tool-name-sanitize /
+  //   pi-ai-tool-name-wire / pi-ai-quota-not-retryable；其间 60 = 62 − 2 退役
+  //   preset-seat-fix、token-meter-clamp，均为 0.1.5-rc.1 上游原生修复）。
+  // 59 = 64（上一基线）− 6 项退役 + 1 项取代新增（0.2.0-rc.2 重靶，逐项点名）：
+  //   ① loader-tree-isolation：cordis-plugin-loader 1.0.5 自己做到逐条目隔离
+  //      （EntryGroup.update 每 id 各自 .catch(logger.error)、EntryTree.await 只
+  //      allSettled），全文件 throw 25→3 处，插入点消失；
+  //   ② fallback-heal-isolation：rc.2 的 heal 回环已改逐名 try/catch，同款守卫原生；
+  //   ③ settings-section-guard：`this.register(ns, schema, {` 调用点与 installSection
+  //      全内核 0 命中，锚点所在函数不复存在；
+  //   ④ atomic-write-orphan-lock：上游 withFileLock 竞争分支原生 takeOverExitedLock
+  //      （按锁记录 PID 探活 + `<lock>.takeover-<digest>` 独占 claim），比我们那份更严；
+  //   ⑤ model-image-input：上游原生 inputModalities（控件 + adopt 白名单 + 门槛语义
+  //      三处前提同时失效）；
+  //   ⑥ profile-bundle-guard-profileboot：dsh 主包的 profile-boot-*.js 装配面消失，
+  //      补丁层读取收口进 dsh-app-boot 的 readProfilePatches；
+  //   ＋ profile-patch-layer-guard（取代 ⑥，order 130，同靶 APP_BOOT_PKG_REL 的
+  //      readProfilePatches 用户补丁层防护）。
+  // 另：workspace-pin（侧栏工作区置顶，order 215）与 open-project-dir / session-manage
+  // 三处 UI 靶均在 rc.2 重锚后仍在册。
+  assert.equal(PATCH_SPECS.length, 59, 'spec 总数应为 59');
   const orders = PATCH_SPECS.map((s) => s.order);
   assert.equal(new Set(orders).size, orders.length, 'order 必须全局唯一');
   const byId = Object.fromEntries(PATCH_SPECS.map((s) => [s.id, s]));
@@ -219,7 +213,12 @@ test('E. order 全局唯一、组内升序、补丁间依赖序成立', () => {
 });
 
 test('E2. K1 三层相互独立（无补丁间依赖、目标文件互不重叠）', () => {
-  const k1 = ['fallback-heal-isolation', 'credentials-initial-retry', 'credentials-absent-guidance'];
+  // rc.2 重靶后 K1 的口径：原先三层是 fallback-heal-isolation(151) +
+  // credentials-initial-retry(152) + credentials-absent-guidance(153)，其中
+  // fallback-heal-isolation 已退役（rc.2 的 heal 回环原生逐名 try/catch），
+  // 现存的最长连续三层守卫带随之是 152/153/154（凭证首读重试 → 凭证缺失指引 →
+  // 设备授权指引），三者靶文件互不相同、互不依赖。
+  const k1 = ['credentials-initial-retry', 'credentials-absent-guidance', 'device-auth-guidance'];
   const byId = Object.fromEntries(PATCH_SPECS.map((s) => [s.id, s]));
   for (const id of k1) {
     assert.ok(byId[id], `${id} 必须登记`);
@@ -230,11 +229,11 @@ test('E2. K1 三层相互独立（无补丁间依赖、目标文件互不重叠�
   // 三层目标文件两两不重叠。
   const targets = k1.map((id) => norm(byId[id].pkgRel || (byId[id].pkgRels || []).join('|')));
   assert.equal(new Set(targets).size, 3, 'K1 三层目标文件必须互不相同');
-  // K1 order 恰为 151/152/153（连续三层，不夹其他补丁）。
+  // K1 order 恰为 152/153/154（连续三层，不夹其他补丁）。
   assert.deepEqual(
     k1.map((id) => byId[id].order).sort((a, b) => a - b),
-    [151, 152, 153],
-    'K1 三层 order 应恰为 151/152/153',
+    [152, 153, 154],
+    'K1 三层 order 应恰为 152/153/154',
   );
 });
 
@@ -249,9 +248,11 @@ test('E3. device-auth 154 与 credentials-absent 153 相邻无干扰', () => {
   );
 });
 
-test('F. cli:true 恰为 28 项；failPolicy ∈ {warn,degrade}', () => {
+test('F. cli:true 恰为 26 项；failPolicy ∈ {warn,degrade}', () => {
   const cliSpecs = registry.getSpecsByCli();
-  assert.equal(cliSpecs.length, 28, 'cli:true 数量（含 skill-dirs-compat + pi-ai-4xx-dump + workspace-chip-label-hold + model-image-input + pi-ai Responses 工具名净化 + pi-ai 工具名 wire 中央收口 + pi-ai 配额耗尽不重试；token-meter-clamp 已退役）');
+  // 26 = 28（上一基线）− atomic-write-orphan-lock − model-image-input（两条 rc.2 退役，
+  // 见 E 的①–⑥）；token-meter-clamp / preset-seat-fix 早在 0.1.5-rc.1 同批退役。
+  assert.equal(cliSpecs.length, 26, 'cli:true 数量（含 skill-dirs-compat + pi-ai-4xx-dump + workspace-chip-label-hold + pi-ai Responses 工具名净化 + pi-ai 工具名 wire 中央收口 + pi-ai 配额耗尽不重试；atomic-write-orphan-lock / model-image-input / token-meter-clamp 已退役）');
   for (const s of cliSpecs) assert.equal(s.cli, true);
   for (const spec of PATCH_SPECS) {
     assert.ok(

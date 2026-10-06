@@ -78,12 +78,14 @@ const LLM_PKG_REL = path.join('dsh-llm', 'lib', 'index.js');
 // loader 自动隔离补丁目标（cordis-plugin-loader 是 @deepseek-ai scope 下的包）。
 const LOADER_PKG_REL = path.join('cordis-plugin-loader', 'lib', 'index.js');
 const APP_BOOT_PKG_REL = path.join('dsh-app-boot', 'lib', 'index.js');
-// agent-preset 未知 id 回落补丁目标（dsh-agent-presets）：lib/index.js 是运行时
-// 经 exports "." 实际加载的入口；lib/invariant.js 为同源产物（锚点文本一致），
-// 无人加载但一并覆盖，防未来消费方走 /invariant 出口时漏保护。
+// agent-preset 未知 id 回落补丁目标。0.2.0-rc.2：dsh-agent-presets 已拆成
+// dsh-agent-preset（声明）+ dsh-agent-preset-registry（注册表，resolve/retain 的
+// not-found 硬抛在这里）。lib/index.js 是运行时经 exports "." 实际加载的入口；
+// lib/invariant.js 为同源产物（exports "./invariant"，锚点文本一致），无人加载但
+// 一并覆盖，防未来消费方走 /invariant 出口时漏保护。
 const AGENT_PRESET_FALLBACK_PKG_RELS = [
-  path.join('dsh-agent-presets', 'lib', 'index.js'),
-  path.join('dsh-agent-presets', 'lib', 'invariant.js'),
+  path.join('dsh-agent-preset-registry', 'lib', 'index.js'),
+  path.join('dsh-agent-preset-registry', 'lib', 'invariant.js'),
 ];
 // prompt 插值 name-invalid 字面透传补丁目标（dsh-system-prompt）：lib/index.js
 // 是运行时经 exports "." 实际加载的入口（interpolate() 所在，锚点 :117-118）。

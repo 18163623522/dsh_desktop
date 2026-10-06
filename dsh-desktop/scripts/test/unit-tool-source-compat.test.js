@@ -26,7 +26,7 @@ const sessionTarget = path.join(nmRoot, '@deepseek-ai', SESSION_VALIDATION_REL);
 const loopTarget = path.join(nmRoot, '@deepseek-ai', AGENT_LOOP_REL);
 
 function badToolResultEvent(seq) {
-  // 事故形态：tool/result 的 source.callId 与 block.toolCallId 都是空串。
+  // 事故形态：tool/result 的 source.callId 与消息级 toolCallId 都是空串。
   return {
     type: 'tool/result',
     seq,
@@ -41,8 +41,15 @@ function badToolResultEvent(seq) {
       step: 1,
       message: {
         id: 'msg-' + seq,
-        role: 'user',
+        // rc.2 起 assertMessageEventShape 按 MESSAGE_ROLE_BY_TYPE 逐类型校验
+        // role，tool/result 必须是 "tool"（旧夹具写 user，事件在 callId 容错
+        // 之前就抛 "message must have role \"tool\""）。
+        role: 'tool',
         source: { kind: 'tool', callId: '' },
+        // rc.2 把 callId 的镜像位从 content[0] 块上移到消息记录自身
+        // （message.toolCallId）；校验与就地修复都按新位置走，content 里
+        // 的 toolCallId 只是块级原文，不再是被测面。
+        toolCallId: '',
         content: [{ type: 'tool-result', toolCallId: '', content: [{ type: 'text', text: 'ok' }] }],
       },
     },
@@ -84,10 +91,11 @@ test('打补丁后的 dsh-session：空 callId 的 tool/result 就地修复放�
   const mod = await import(`${pathToFileURL(sessionTarget).href}?tool-source-tolerance`);
   const ev = badToolResultEvent(450516);
   const adopted = mod.adoptSessionEvent(ev);
-  const source = adopted.data.message.source;
-  assert.equal(source.kind, 'tool');
-  assert.equal(source.callId, 'recovered-seq-450516');
-  assert.equal(adopted.data.message.content[0].toolCallId, 'recovered-seq-450516');
+  const message = adopted.data.message;
+  assert.equal(message.source.kind, 'tool');
+  assert.equal(message.source.callId, 'recovered-seq-450516');
+  // rc.2 的镜像位在消息记录自身——修复必须把两侧对齐，否则下一轮校验又抛不一致。
+  assert.equal(message.toolCallId, 'recovered-seq-450516');
 });
 
 test('打补丁后的 dsh-session：source.callId 缺失（非空串形态）同样修复', async () => {
@@ -95,7 +103,7 @@ test('打补丁后的 dsh-session：source.callId 缺失（非空串形态）同
   const mod = await import(`${pathToFileURL(sessionTarget).href}?tool-source-tolerance`);
   const ev = badToolResultEvent(7);
   delete ev.data.message.source.callId;
-  ev.data.message.content[0].toolCallId = 'real-call-1';
+  ev.data.message.toolCallId = 'real-call-1';
   // 一侧为空一侧非空 → 以非空侧为准。
   const adopted = mod.adoptSessionEvent(ev);
   assert.equal(adopted.data.message.source.callId, 'real-call-1');
@@ -106,7 +114,7 @@ test('打补丁后的 dsh-session：双非空不一致仍是硬损坏，继续�
   const mod = await import(`${pathToFileURL(sessionTarget).href}?tool-source-tolerance`);
   const ev = badToolResultEvent(9);
   ev.data.message.source.callId = 'call-a';
-  ev.data.message.content[0].toolCallId = 'call-b';
+  ev.data.message.toolCallId = 'call-b';
   assert.throws(() => mod.adoptSessionEvent(ev), /mismatched tool call ids/);
 });
 
@@ -115,7 +123,7 @@ test('打补丁后的 dsh-session：正常的 tool/result 事件不受影响', a
   const mod = await import(`${pathToFileURL(sessionTarget).href}?tool-source-tolerance`);
   const ev = badToolResultEvent(11);
   ev.data.message.source.callId = 'call-ok';
-  ev.data.message.content[0].toolCallId = 'call-ok';
+  ev.data.message.toolCallId = 'call-ok';
   const adopted = mod.adoptSessionEvent(ev);
   assert.equal(adopted.data.message.source.callId, 'call-ok');
 });

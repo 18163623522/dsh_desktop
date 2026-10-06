@@ -86,34 +86,36 @@ test('幂等：二遍 already', () => {
 
 test('行为：403 + 设备风控特征 → 追加中文指引（vm 实跑注入分支）', () => {
   const r = transformDeviceAuthGuidance(pristineSrc(), 'index.js');
-  // 从产物抽出注入的判定分支（缩进无关：起点=判定 if，终点=message += 行后首个 }）。
-  const start = r.src.indexOf('if ((response.status === 401');
+  // 0.2.0-rc.2 形态：注入体是一条 __dshDeviceAuthHint 三元表达式（前两代是
+  // `if (…) { message += … }` 语句块，rc.2 里 message 已不可变，故改写为表达式
+  // 拼在 errorMessage(...) 尾部）。这里取整行在 vm 里实跑，测的是注入产物本身。
+  const start = r.src.indexOf('const __dshDeviceAuthHint = ');
   assert.ok(start >= 0, '注入的设备授权判定分支必须存在');
-  const msgIdx = r.src.indexOf('message += "', start);
-  assert.ok(msgIdx > 0, '指引追加行必须存在');
-  const end = r.src.indexOf('}', msgIdx);
-  const branch = r.src.slice(start, end + 1);
+  const lineEnd = r.src.indexOf('\n', start);
+  const branch = r.src.slice(start, lineEnd);
+  assert.ok(r.src.includes('files.errorMessage(response.status, failure.message, detail) + __dshDeviceAuthHint'),
+    '指引必须拼在最终抛出文案尾部（errorMessage 的返回值才是用户看到的那句）');
   const deviceMsg = 'This device is not authorized. Please contact the administrator or try again later.';
-  function run(status, message) {
-    const sandbox = `
-      var message = ${JSON.stringify(message)};
+  function run(status, message, detail) {
+    return vm.runInNewContext(`
       var response = { status: ${status} };
-      var before = message;
+      var failure = { message: ${JSON.stringify(message)} };
+      var detail = ${JSON.stringify(detail === undefined ? '' : detail)};
       ${branch}
-      ({ grew: message.length > before.length, message });
-    `;
-    return vm.runInNewContext(sandbox);
+      __dshDeviceAuthHint;
+    `);
   }
   const hit = run(403, deviceMsg);
-  assert.ok(hit.grew, '403 + not authorized 必须追加指引');
-  assert.ok(hit.message.includes('chat.deepseek.com'), '指引必须含换令牌路径');
-  assert.ok(hit.message.includes(deviceMsg), '原文保留在前');
+  assert.ok(hit.includes('chat.deepseek.com'), '403 + not authorized 必须追加指引');
+  assert.ok(hit.includes('凭据被 DeepSeek 服务端拒绝'), '指引要有能一眼认出的一句标题');
   const hit401 = run(401, '设备未授权，请联系管理员');
-  assert.ok(hit401.grew, '401 + 中文设备未授权也命中');
+  assert.ok(hit401.includes('chat.deepseek.com'), '401 + 中文设备未授权也命中');
+  const hitDetail = run(403, 'DeepSeek API error (HTTP 403)', deviceMsg);
+  assert.ok(hitDetail.includes('chat.deepseek.com'), '特征只在 detail 里也要命中（rc.2 的 message/detail 分工）');
   const generic = run(401, 'Authentication Fails, Your api key is invalid');
-  assert.ok(!generic.grew, '一般性密钥错误不追加（防噪音）');
+  assert.equal(generic, '', '一般性密钥错误不追加（防噪音）');
   const ok500 = run(500, deviceMsg);
-  assert.ok(!ok500.grew, '非 401/403 不追加（5xx 也可能带该文案，指引只谈凭据）');
+  assert.equal(ok500, '', '非 401/403 不追加（5xx 也可能带该文案，指引只谈凭据）');
 });
 
 test('registry 登记：guard 组 order 154 / cli:false / marker 导出', () => {

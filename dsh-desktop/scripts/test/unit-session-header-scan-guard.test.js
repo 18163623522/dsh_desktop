@@ -56,6 +56,16 @@ const MAX_BYTES = 256 * 1024;
 // ---------------------------------------------------------------------------
 const FIXTURE = [
   'import { open, stat } from "node:fs/promises";',
+  // 真实内核从 @deepseek-ai/dsh-session-persistence 导入该类（rc.1 起在 import 列
+  // 表里）；fixture 自包含，用同形本地类替代。读上限注入体必须抛**这个类**——
+  // listArtifacts 的 corrupt-guard 白名单只收容它与 SessionFormatUnsupportedError，
+  // 裸 Error 会击穿启动扫描。
+  'class SessionPersistenceCorruptionError extends Error {',
+  '\tconstructor(message) {',
+  '\t\tsuper(message);',
+  '\t\tthis.name = "SessionPersistenceCorruptionError";',
+  '\t}',
+  '}',
   'function scanZstdFrames(buffer, maxFrames) {',
   '\t// test stub: never finds a frame, so readFirstZstdLine accumulates to EOF or the cap.',
   '\treturn { frames: [] };',
@@ -128,7 +138,7 @@ const FIXTURE = [
   '\t\treturn first;',
   '\t}',
   '};',
-  'export { JsonlSessionPersistence };',
+  'export { JsonlSessionPersistence, SessionPersistenceCorruptionError };',
 ].join('\n');
 
 // pristine 内核源（由 scripts/install-pristine-kernel.mjs 离线解包的
@@ -239,16 +249,19 @@ test('缓存失效：文件 size 变化后重读（不掩盖真实变更）', as
   assert.equal(inst.lineReads, 2, '文件变更后必须失效重读');
 });
 
-test('读取上限：>256KB 无完整首帧 → 抛错而非无限累积', async (t) => {
-  const inst = await instantiate(t, transformSessionHeaderScanGuard(FIXTURE, 'f.mjs').src, 'zstd');
+test('读取上限：>256KB 无完整首帧 → 抛损坏类错误而非无限累积', async (t) => {
+  const mod = await loadPatchedModule(t, transformSessionHeaderScanGuard(FIXTURE, 'f.mjs').src);
+  const inst = new mod.JsonlSessionPersistence('zstd');
   const dir = tmpdir(t, 'dsh-k5-cap-');
   const file = path.join(dir, 'session.jsonl.zstd');
   fs.writeFileSync(file, Buffer.alloc(300 * 1024, 0x41)); // 300KB 无 zstd 首帧
 
   await assert.rejects(
     inst.readFirstZstdLine(file, undefined),
-    (err) => err instanceof Error && err.message.includes('no complete header frame within') && err.message.includes(String(MAX_BYTES)),
-    '累积超 256KB 无首帧应抛错（被 corrupt-guard catch 后 warn 跳过）',
+    (err) => err instanceof mod.SessionPersistenceCorruptionError
+      && err.message.includes('no complete header frame within')
+      && err.message.includes(String(MAX_BYTES)),
+    '累积超 256KB 无首帧应抛 SessionPersistenceCorruptionError（corrupt-guard 白名单只收容它，裸 Error 击穿启动扫描）',
   );
   assert.equal(inst.zstdReads, 1, '读上限路径只触发一次读取入口');
 });
@@ -288,12 +301,15 @@ test('回归：corrupt-guard 损坏跳过 + warn 语义保留（叠加应用后 
   const out = r.src;
   assert.ok(out.includes('dsh-desktop-corrupt-guard-v1'), 'corrupt-guard marker 应保留');
   assert.ok(out.includes('skipping corrupt session log'), 'warn 跳过文案应保留');
-  // rc.1 形态：corrupt-guard 不再另起 `catch (corruptError)`（alpha.5 形态），而是
+  // rc.1→rc.2 形态：corrupt-guard 不再另起 `catch (corruptError)`（alpha.5 形态），而是
   // 就地改写 listArtifacts 包住 readGenerationHeader 调用的那个 catch(error)：
-  // 格式版本不兼容仍先行 continue，其余告警 + continue 跳过该会话。
+  // 上游原生白名单的两类（格式版本不兼容 + 持久化损坏）先行 continue，其余告警 +
+  // continue 跳过该会话——第二类正是我们注入的读上限错误所依赖的收容路径。
   assert.match(out,
-    /try \{\n\t+header = await this\.readGenerationHeader\(selected, void 0, signal\);\n\t+\} catch \(error\) \{\n\t+if \(error instanceof SessionFormatUnsupportedError\) continue;\n\t+\/\/ dsh-desktop-corrupt-guard-v1[^\n]*\n\t+console\.warn\(`\[dsh-session-persistence\] skipping corrupt session log: \$\{selected\.sourcePath\}[^\n]*\n\t+continue;\n\t+\}/,
+    /try \{\n\t+header = await this\.readGenerationHeader\(selected, void 0, signal\);\n\t+\} catch \(error\) \{\n\t+if \(error instanceof SessionFormatUnsupportedError(?: \|\| error instanceof SessionPersistenceCorruptionError)?\) continue;\n\t+\/\/ dsh-desktop-corrupt-guard-v1[^\n]*\n\t+console\.warn\(`\[dsh-session-persistence\] skipping corrupt session log: \$\{selected\.sourcePath\}[^\n]*\n\t+continue;\n\t+\}/,
     'corrupt-guard 应包住 readGenerationHeader 调用并保留 版本continue/告警/continue 三要素');
+  assert.ok(out.includes('error instanceof SessionPersistenceCorruptionError) continue;'),
+    'rc.2 上游白名单第二类的 continue 必须原样保留（我们只补不进白名单的那一类）');
   // 读行走 helper 且仍在 try 内（helper 的 stat/读上限抛错经 readGenerationHeader
   // 保留的重抛上抛，最终被 corrupt-guard 吸收，不击穿扫描）。
   const READ_CALL = 'first = await this.readHeaderLineCached(selected.sourcePath, signal);';

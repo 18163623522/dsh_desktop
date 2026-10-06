@@ -55,6 +55,14 @@
 //              #182 / open-project-dir / session-persistence corrupt /
 //              wsl-picker / header-scan / ds-tool / conversation-assembly /
 //              reasoning-row / unknown-event）。
+//   退役说明（0.2.0-rc.2 重靶期）：atomic-write-orphan-lock 已由上游原生修复
+//              （withFileLock 竞争分支内 `else if (await takeOverExitedLock(lockPath))
+//              continue`——按锁记录 PID 探活，ESRCH 即删锁重试，且用
+//              `<lock>.takeover-<sha256 前 16 位>` 独占claim 把双删竞态做得比
+//              我们那份更严；EPERM/PID 复用按仍存活处理，语义与我们一致），
+//              从 PATCH_SPECS 摘除，transformOrphanLock 保留休眠；
+//              menu-viewport 的 #182 半边同批退役（上游 useLayoutEffect 改为逐帧
+//              requestAnimationFrame 重定位，首帧 lw=0 的横向溢出下一帧即被修正）。
 // ---------------------------------------------------------------------------
 
 const path = require('node:path');
@@ -77,7 +85,6 @@ const {
   PERSISTENT_SHELL_PKG_RELS,
   TERMINAL_BASH_REL,
   ATTACH_LOCAL_REL,
-  LOADER_PKG_REL,
   APP_BOOT_PKG_REL,
   AGENT_PRESET_FALLBACK_PKG_RELS,
   PROMPT_CONTEXT_LITERAL_PKG_RELS,
@@ -113,8 +120,7 @@ const {
   transformConversationAssemblyResilience,
   transformProfilePatchGuard,
   transformProfileBundleAppBoot,
-  transformProfileBundleProfileBoot,
-  transformSettingsSectionGuard,
+  transformProfilePatchLayerGuard,
   transformManualSortFix,
   transformPluginInventoryTabMergeFix,
   transformPersistentShellAbortRace,
@@ -122,7 +128,6 @@ const {
   transformAgentPresetFallback,
   transformPromptContextLiteral,
   // K1（credentials service is absent 偶发）三层修复。
-  transformFallbackHealIsolation,
   transformCredentialsInitialRetry,
   transformCredentialsAbsentGuidance,
   // 设备未授权（DeepSeek 服务端风控 403）报文追加可操作指引。
@@ -158,15 +163,13 @@ const {
   SLOT_ERROR_ISOLATE_MARKER_V2,
   PROFILE_PATCH_GUARD_MARKER,
   PROFILE_BUNDLE_GUARD_MARKER,
-  PROFILE_BOOT_GUARD_MARKER,
-  SETTINGS_SECTION_MARKER,
+  APP_BOOT_PATCH_LAYER_GUARD_MARKER,
   MANUAL_SORT_DRAG_MARKER,
   PLUGIN_INVENTORY_TAB_MARKER,
   PERSISTENT_ABORT_RACE_MARKER,
   INTERRUPT_ESCALATION_MARKER,
   AGENT_PRESET_FALLBACK_MARKER,
   PROMPT_CONTEXT_LITERAL_MARKER,
-  FALLBACK_HEAL_ISOLATION_MARKER,
   CREDENTIALS_INITIAL_RETRY_MARKER,
   CREDENTIALS_ABSENT_GUIDANCE_MARKER,
   DEVICE_AUTH_GUIDANCE_MARKER,
@@ -179,7 +182,6 @@ const {
   // transform 的升级通道引用，不作为 spec.marker（否则在野旧副本会被 already
   // 短路、永不升级）。
   SESSION_LOAD_GRACEFUL_MARKER_V3,
-  LOADER_TREE_ISOLATION_MARKER,
   LOADER_ACTIVATION_ISOLATION_MARKER,
   FAIL_LOUD_ISOLATION_MARKER,
   CODEX_LOCAL_BIN_MARKER,
@@ -202,7 +204,6 @@ const {
 } = require('./patch-adapters').markers;
 
 const {
-  transformLoaderTreeIsolation,
   transformLoaderActivationIsolation,
   transformFailLoudIsolation,
 } = require('./loader-isolation');
@@ -494,71 +495,42 @@ const PATCH_SPECS = [
       failLog: (file, err) => 'profile bundle 防护失败(' + file + '): ' + err.message,
     },
   },
-  // profile-boot 目录下的 profile-boot-*.js 需要运行时扫描目录，由 patch-runner
-  // 以 layout='profile-boot-dirs' 特殊处理（见 patch-target-resolver LAYOUTS）。
+  // 0.2.0-rc.2：dsh 主包的 profile-boot-*.js 装配面消失，补丁层读取收口进
+  // dsh-app-boot 的 readProfilePatches（同时是 dsh-hmr 的进口）。防护随之改挂
+  // 同一靶文件，不再需要 layout='profile-boot-dirs' 的运行时目录扫描。
   {
-    id: 'profile-bundle-guard-profileboot',
+    id: 'profile-patch-layer-guard',
     group: 'guard',
     order: 130,
     kind: 'file',
-    layout: 'profile-boot-dirs',
-    wslLayout: 'profile-boot-dirs',
-    pkgRels: [],
-    transform: transformProfileBundleProfileBoot,
-    marker: PROFILE_BOOT_GUARD_MARKER,
-    requires: [],
-    failPolicy: 'warn',
-    cli: false,
-    logs: {
-      prefix: 'profile bundle 防护',
-      doneLog: (file) => '已注入自愈装配到 ' + file,
-      failLog: (file, err) => 'profile bundle 防护失败(' + file + '): ' + err.message,
-    },
-  },
-  {
-    id: 'settings-section-guard',
-    group: 'guard',
-    order: 140,
-    kind: 'file',
     layout: 'guard',
     wslLayout: 'guard',
-    pkgRel: path.join('dsh-settings', 'lib', 'index.js'),
-    transform: transformSettingsSectionGuard,
-    marker: SETTINGS_SECTION_MARKER,
+    pkgRel: APP_BOOT_PKG_REL,
+    transform: transformProfilePatchLayerGuard,
+    marker: APP_BOOT_PATCH_LAYER_GUARD_MARKER,
     requires: [],
     failPolicy: 'warn',
     cli: false,
     logs: {
-      prefix: 'settings 注册防护',
-      doneLog: (file) => '已注入到 ' + file,
-      failLog: (file, err) => 'settings 注册防护失败: ' + err.message,
+      prefix: '用户补丁层防护',
+      doneLog: (file) => '已注入自愈加载到 ' + file,
+      failLog: (file, err) => '用户补丁层防护失败(' + file + '): ' + err.message,
     },
   },
   // -------------------------------------------------------------------------
-  // loader 自动隔离（单插件失败不拖垮整棵插件树）：loader 失败分支 →
-  // 跳过 + 标记；boot 激活审计 → 跳过 + 标记；installFailLoud 就绪后不 exit。
-  // 受保护核心（dsh-base / dsh-web-app）失败仍 fatal。落盘 quarantine 由壳层
-  // 观察标记后统一执行（见 scripts/plugin-core/lib/quarantine.js）。
+  // loader 自动隔离（单插件失败不拖垮整棵插件树）：boot 激活审计 → 跳过 + 标记；
+  // installFailLoud 就绪后不 exit。受保护核心（dsh-base / dsh-web-app）失败仍
+  // fatal。落盘 quarantine 由壳层观察标记后统一执行（见
+  // scripts/plugin-core/lib/quarantine.js）。
+  // 【已退役】loader-tree-isolation：0.2.0-rc.2 的 cordis-plugin-loader 1.0.5
+  // 自己做到了逐条目隔离（EntryGroup.update 每个 id 各自 .catch(logger.error)、
+  // EntryTree.await 只 Promise.allSettled、导入失败也只 logger.error），
+  // 全文件 throw 从 25 处降到 3 处（均为条目查找错误），AggregateError /
+  // failures / "loader fibers failed" 0 命中，插入点消失。
+  // ⚠ 代价：核心条目（dsh-base / dsh-web-app）失败现在也只有一行 error 日志，
+  //   不再由 loader 抛出；致命性只剩 boot 激活审计（loader-activation-isolation）
+  //   与 installFailLoud 两道，故这两条必须保住。
   // -------------------------------------------------------------------------
-  {
-    id: 'loader-tree-isolation',
-    group: 'guard',
-    order: 145,
-    kind: 'file',
-    layout: 'guard',
-    wslLayout: 'guard',
-    pkgRel: LOADER_PKG_REL,
-    transform: transformLoaderTreeIsolation,
-    marker: LOADER_TREE_ISOLATION_MARKER,
-    requires: [],
-    failPolicy: 'warn',
-    cli: false,
-    logs: {
-      prefix: 'loader 树级自动隔离',
-      doneLog: (file) => '已注入自动隔离到 ' + file,
-      failLog: (file, err) => 'loader 树级自动隔离失败: ' + err.message,
-    },
-  },
   {
     id: 'loader-activation-isolation',
     group: 'guard',
@@ -630,25 +602,8 @@ const PATCH_SPECS = [
   //   fallback heal 单点容错 + credentials 首读瞬时重试 + 报错文案指引。
   // 根因：半套 fallback 树（heal 单名失败整体中止）× loader 隔离静默降级 →
   // credentials 服务缺席，用户保存 API key 才暴露。详见 patch-adapters K1 注释。
-  {
-    id: 'fallback-heal-isolation',
-    group: 'guard',
-    order: 151,
-    kind: 'file',
-    layout: 'guard',
-    wslLayout: 'guard',
-    pkgRel: APP_BOOT_PKG_REL,
-    transform: transformFallbackHealIsolation,
-    marker: FALLBACK_HEAL_ISOLATION_MARKER,
-    requires: [],
-    failPolicy: 'warn',
-    cli: false,
-    logs: {
-      prefix: 'fallback heal 单点容错',
-      doneLog: (file) => '已注入逐名容错到 ' + file,
-      failLog: (file, err) => 'fallback heal 单点容错失败(' + file + '): ' + err.message,
-    },
-  },
+  // 【已退役】fallback-heal-isolation：rc.2 删除了整个 fallback junction heal
+  // 子系统（详见 patch-adapters.js K1 段说明），写链接循环锚点 0 命中。
   {
     id: 'credentials-initial-retry',
     group: 'guard',
@@ -967,6 +922,7 @@ const PATCH_SPECS = [
   //      settings.yaml.lock 孤儿，此后该机所有设置写入 2s 超时失败（页面只读
   //      面全部正常，用户只见英文路径报错沉在表单底部）。竞争分支追加「锁内
   //      PID 已死即删」探测，PID 复用/权限歧义退回上游语义。
+  //      —— 0.2.0-rc.2 起该层退役，见下方退役说明。
   //   2) 设置页韧性（dsh-client-ui-settings-models）——describe 镜像只在 idle
   //      首载而宿主 register 不发事件，镜像陈旧时「添加自定义供应商」按钮
   //      protocols=[] 恒灰、「添加」addNamespace 缺席点击无反应；load() 在
@@ -975,21 +931,14 @@ const PATCH_SPECS = [
   //      冲突报错，观感同「没反应」）。
   // failPolicy warn：上游形态漂移时 anchor-missing 自动退役，不阻断 boot。
   // -------------------------------------------------------------------------
-  {
-    id: 'atomic-write-orphan-lock',
-    group: 'package',
-    order: 242,
-    kind: 'root',
-    layout: 'nm-roots',
-    wslLayout: 'nm-roots',
-    apply: rootAppliers.patchAtomicWriteOrphanLock,
-    marker: null,
-    requires: [],
-    failPolicy: 'warn',
-    cli: true,
-    successLog: (root) => '孤儿锁自愈补丁: 已应用到 ' + root,
-    failLog: (root, err) => '孤儿锁自愈补丁失败(' + root + '): ' + err.message,
-  },
+  // -------------------------------------------------------------------------
+  // atomic-write-orphan-lock 已退役（0.2.0-rc.2 重靶期）：上游在 withFileLock 的
+  // 竞争分支里原生加了 takeOverExitedLock——按锁记录 PID 探活，ESRCH 即删锁重试，
+  // 并用 `<lock>.takeover-<digest>` 独占 claim 兜住双删竞态；EPERM（他人 PID /
+  // 跨用户存活）与不可解析的锁记录一律按仍存活处理，与我们那份同语义、且更严。
+  // patchAtomicWriteOrphanLock / transformOrphanLock 保留休眠（参照 preset-seat-fix
+  // 先例），锚点已在脚本头注明退役判据，别在版本回退时误恢复。
+  // -------------------------------------------------------------------------
   {
     id: 'settings-models-resilience',
     group: 'package',
@@ -1127,41 +1076,23 @@ const PATCH_SPECS = [
   },
 
   // -------------------------------------------------------------------------
-  // 模型卡「支持图片输入」勾选补丁（用户反馈「某些多模态模型依旧说不支持图片」）。
-  // 手声明路由（llm-pi-ai.providers.<route>）的 models[] 条目在设置页里从不写
-  // `input`——上游 ModelListEditor 根本没这个控件。而 dsh-llm-pi-ai 逐模型解析是
-  // `declaredInput(entry.input) ?? base?.input ?? [...defaultInput]`（:672），手
-  // 声明路由无内置目录基条目、又未写 defaultInput → 恒回落 DEFAULT_INPUT=["text"]
-  // （:883），且 resolveModelInfo 仍返回 inputModalities:[...input]（:1760）——
-  // 属「已声明为纯文本」而非「未声明」，故门槛 !includes("image") 恒真：
-  // dsh-api-session-controller:753 走 VLM 转述（未配置即抛 MODEL_DOES_NOT_SUPPORT
-  // _IMAGES → 客户端「当前模型不支持图片，请切换支持图片的模型」），且 dsh-llm
-  // :1701 projectImagesForTextModel 会把图片替换为文字占位，模型真的收不到图。
-  // 上游取 ["text"] 为默认是有意保守（少报=发送前拒；多报=消息落库后中途失败、
-  // 会话反复重试），故不放宽默认，而是补上缺失的控件：ModelListEditor 逐行展开
-  // 区（grid，已含 contextWindow/maxTokens）追加第三格 checkbox，勾选写显式
-  // input:["text","image"]、取消写显式 ["text"]（不删键，避免继承语义歧义）。
-  // 写回链路不动：pathOps 是通用 key 级 diff、整组 models 一次 set，不裁未知字段。
-  // 附带 adopt()：该白名单原本丢弃端点自报模态，现保留 image，“获取模型”
-  // 勾选即自动勾好。注：pi-ai MODALITIES 仅 text/image（:274），无「视频」模态，
-  // 故只做图片勾选。与 settings-models-resilience 同靶不同区段，互不重叠。
-  // 锚点失配（上游重构该卡）自动退役。见 scripts/lib/patch-model-image-input.js。
+  // model-image-input 已退役（0.2.0-rc.2 重靶期）：上游把「图片输入」做成了原生
+  // 能力，本补丁的三组注入全部无增量（实测锚点 5 中 4 失配，只有 numberOf 块还在）：
+  //   · 控件：dsh-client-ui-settings-models 新增 ModelInputTypes（client.js:171），
+  //     展开区 grid 里直接渲染 ["text","image"] 两个 Checkbox（:250 起、:268 调用），
+  //     字段名 inputModalities（:485 inputField）；
+  //   · adopt()：字段白名单已含 `...candidate.inputModalities === void 0 ? {} :
+  //     { input: [...candidate.inputModalities] }`（:580），端点自报模态不再被丢；
+  //   · 门槛语义：dsh-api-session-controller:873 改为「已声明且不含 image 才拒」
+  //     （model.inputModalities !== void 0 && !includes("image")），未声明不再当作
+  //     纯文本；dsh-llm:2311 的 projectImagesForTextModel 同样只在显式声明不含
+  //     image 时触发；dsh-llm/lib/typert.host.js:19 把 inputModalities 收进 zod
+  //     schema（text|image 数组、optional），dsh-llm-pi-ai:1806 起以
+  //     inputModalities:[...model.input] 双向投影。
+  // 原补丁的三个前提（无控件、白名单丢模态、恒回落 DEFAULT_INPUT=["text"]）全部
+  // 失效。patch-model-image-input.js 保留（休眠），参照 token-meter-clamp /
+  // atomic-write-orphan-lock 先例，别在版本回退时误恢复。
   // -------------------------------------------------------------------------
-  {
-    id: 'model-image-input',
-    group: 'package',
-    order: 248,
-    kind: 'root',
-    layout: 'nm-roots',
-    wslLayout: 'nm-roots',
-    apply: rootAppliers.patchModelImageInput,
-    marker: null,
-    requires: [],
-    failPolicy: 'warn',
-    cli: true,
-    successLog: (root) => '模型图片输入勾选补丁: 已应用到 ' + root,
-    failLog: (root, err) => '模型图片输入勾选补丁失败(' + root + '): ' + err.message,
-  },
 
   // -------------------------------------------------------------------------
   // agent-preset 未知 id 回落补丁（0.5.0 存量用户 resume 变砖修复，追加条目）。
@@ -1448,11 +1379,15 @@ const PATCH_SPECS = [
   },
 
   // -------------------------------------------------------------------------
-  // dsh-llm-deepseek 工具净化补丁（ds-tool-schema-sanitize）：deepseek-official
-  // 路由独立于 pi-ai 的工具序列化（requestWithMessages 内联 map），同样需要
-  // 名字规范化 + schema 净化 + 回映射（官方 API 校验同款 pattern/required）。
+  // dsh-llm-deepseek 工具净化补丁（ds-tool-schema-sanitize）：官方 DeepSeek
+  // 路由独立于 pi-ai 的工具序列化（适配器自己内联 map），同样需要名字规范化 +
+  // schema 净化 + 回映射（官方 API 校验同款 pattern/required）。
   // 净化实现为纯函数重建——内核 deepFreeze 的 schema 上 delete 会抛 TypeError
   // 导致突变式实现静默失效（wire 探针实测）。cli:true。
+  // rc.2 重锚（四处唯一命中）：适配器改走 Messages 端点，落点为 serialize() 的
+  // 定义名 + input_schema、历史回放 block.name、回程 tool_use native.name。旧
+  // completions 世代实测有两处 name: tool.name 而 String.replace 只洗首现，
+  // Messages 那条一直漏洗——rc.2 只剩一条，重锚顺带补上该洞。multi-site。
   // -------------------------------------------------------------------------
   {
     id: 'ds-tool-schema-sanitize',
@@ -1708,7 +1643,11 @@ const PATCH_SPECS = [
     kind: 'file',
     layout: 'runtime-local',
     wslLayout: 'wsl',
-    pkgRels: [FLASH_PKG_REL, SESSION_CTRL_INDEX_PKG_REL],
+    // 0.2.0-rc.2 起客户端半已由上游原生覆盖：client.js 把两处调用点的 50 收成
+    // 共享常量 HISTORY_PAGE_OPTIONS（maxMessages: 500），比我们的 200 更大，
+    // 且不再有 `maxMessages: 50` 字面量可锚（正则的 \b 也不会误改 500）。
+    // 服务端默认值仍是 50（index.js 的 DEFAULT_MAX_MESSAGES），故只保留该靶。
+    pkgRels: [SESSION_CTRL_INDEX_PKG_REL],
     transform: transformHistoryPageSize,
     marker: HISTORY_PAGE_MARKER,
     requires: [],

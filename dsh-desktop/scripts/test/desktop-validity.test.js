@@ -11,6 +11,7 @@ const {
   checkPluginPackage,
   validatePlugins,
 } = require('../desktop-validity.js');
+const { findPristineFile } = require('../lib/pristine-kernel-roots');
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-valid-test-'));
@@ -159,7 +160,7 @@ test('validatePlugins 健康 profile 全绿', () => {
   assert.deepStrictEqual(out.contractViolations, []);
 });
 
-// ---------- 启动清单契约（declares no dsh.bundle fail-loud）升级 ----------
+// ---------- 启动清单契约（0.2.0-rc.2：逐 bundle 容错跳过，不再 fail-loud）----------
 
 test('checkPluginPackage: 清单内（listed）缺 dsh 声明 → error，未列出 → warning', () => {
   const dir = tmpdir();
@@ -169,7 +170,11 @@ test('checkPluginPackage: 清单内（listed）缺 dsh 声明 → error，未列
   const listed = checkPluginPackage('plain-pkg', path.join(dir, 'plain'), jsonYaml, fs, true);
   assert.strictEqual(listed.issues[0].level, 'error');
   assert.match(listed.issues[0].text, /启动清单/);
-  assert.match(listed.issues[0].text, /fail-loud/);
+  // rc.2 起后果是「跳过该 bundle + stderr 一行」，不是击穿启动。正文必须写真实
+  // 形态：仍升级为 error（我们发出去的插件会静默哑掉），但不得再声称 fail-loud。
+  assert.match(listed.issues[0].text, /跳过该 bundle/);
+  assert.match(listed.issues[0].text, /skipping profile bundle/);
+  assert.doesNotMatch(listed.issues[0].text, /下次启动会 fail-loud/);
 });
 
 test('checkPluginPackage: listed 且 dsh.bundle 缺 patch 声明 → error', () => {
@@ -179,10 +184,27 @@ test('checkPluginPackage: listed 且 dsh.bundle 缺 patch 声明 → error', () 
   const out = checkPluginPackage('bad-bundle', path.join(dir, 'pkg'), jsonYaml, fs, true);
   const err = out.issues.find((i) => i.level === 'error' && /启动清单/.test(i.text));
   assert.ok(err, '应报「在启动清单中但未声明 dsh.bundle.patch」error');
+  // 两种缺声明在 rc.2 内核里抛的是两条不同的 reason 串，正文要分别点名，
+  // 否则排查时按一个串去 grep stderr 会扑空。
   assert.match(err.text, /declares no dsh\.bundle/);
+  assert.match(err.text, /dsh\.bundle\.patch must be a file path/);
   // 同包未列出时该契约问题不升级为 error
   const notListed = checkPluginPackage('bad-bundle', path.join(dir, 'pkg'), jsonYaml, fs, false);
   assert.ok(!notListed.issues.some((i) => i.level === 'error' && /启动清单/.test(i.text)), '未列出不报契约 error');
+});
+
+// 内容契约：诊断正文引用的三条内核串，必须是 rc.2 内核真的会打出来的串。
+// 内核换版改文案时这条先红，避免我们的指引让用户去 stderr 找一行不存在的话。
+test('rc.2 正证：诊断正文引用的 reason 串确实来自内核 loadProfileDirectory', () => {
+  const rel = 'dsh-app-boot/lib/index.js';
+  const hit = findPristineFile(rel);
+  const target = hit || path.join(__dirname, '..', '..', 'node_modules', '@deepseek-ai', ...rel.split('/'));
+  assert.ok(fs.existsSync(target), '找不到内核 dsh-app-boot 入口：' + target);
+  const src = fs.readFileSync(target, 'utf8');
+  assert.ok(/for \(const packageName of bundles\) try \{/.test(src), 'rc.2 内核应逐 bundle try/catch');
+  assert.ok(src.includes('skipping profile bundle'), 'reportSkippedBundles 的 stderr 前缀');
+  assert.ok(src.includes('declares no dsh.bundle in its package.json'), '缺 dsh.bundle 的 reason 串');
+  assert.ok(src.includes('dsh.bundle.patch must be a file path or a list of file paths'), '缺/错 patch 的 reason 串');
 });
 
 test('validatePlugins: 清单内坏包 → ok:false + contractViolations 列出', () => {

@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 // TA6 元测试 5：heal / 回滚面审计（静态分类，报告清单，不实现反向变换）。
 //
-// 对 37 个 file transform 逐个回答「如何撤销」：
+// 对 44 个 file transform 逐个回答「如何撤销」：
 //   - npm-ci 可恢复：目标都在 node_modules/@deepseek-ai 包内，重装即回
 //     pristine（全部 file 补丁皆然——这也是 rc.2→rc.8 升级后补丁自然退役
 //     的机制）；
@@ -14,12 +14,11 @@
 //   - 多点注入：一次 transform 改多处（回滚需逐点处理）。
 //
 // 审计约束（守卫价值）：
-//   1. 分类必须覆盖全部 37 个 file transform（无「无法回滚」盲区）；
+//   1. 分类必须覆盖全部 44 个 file transform（无「无法回滚」盲区）；
 //   2. 每个带 marker 的 transform，marker 必须能定位回滚点（marker 出现在
 //      其 changed 产物中——用 pristine 实跑验证）；
-//   3. root 应用器（14 个）只碰 node_modules 内文件 → npm ci 可整体恢复。
-//      （v0.5.4：+pi-ai-credits / pi-ai-reasoning-defaults / bundle-arrival-retry×2
-//       / agent-loop-scheduler-guard×2 共 4 枚 root 应用器。）
+//   3. root 应用器（15 个）只碰 node_modules 内文件 → npm ci 可整体恢复。
+//      （rc.2 重靶后 atomic-write-orphan-lock / model-image-input 两条退役。）
 // ---------------------------------------------------------------------------
 
 const test = require('node:test');
@@ -55,13 +54,11 @@ const INVERSE_PAIR_HINTS = {
   // 机械可逆——常量对本身就是反向 replace 的全部输入）。
   'runtime-flash-fix': ['FLASH_OLD', 'FLASH_NEW'],
   'profile-patch-guard': ['PROFILE_PATCH_GUARD_CALL_SITE', 'PROFILE_PATCH_GUARD_CALL_REPLACEMENT'],
-  'settings-section-guard': ['SETTINGS_SECTION_FROM', 'SETTINGS_SECTION_GUARDED'],
   'plugin-inventory-tab-merge': ['PLUGIN_INVENTORY_TAB_OLD', 'PLUGIN_INVENTORY_TAB_NEW'],
   'persistent-shell-abort-race': ['PERSISTENT_ABORT_RACE_ANCHOR', 'persistentAbortRaceInjection'],
   'terminal-interrupt-escalation': ['INTERRUPT_ESCALATION_ANCHOR', 'INTERRUPT_ESCALATION_INJECTION'],
   'agent-preset-fallback': ['AGENT_PRESET_FALLBACK_ANCHOR', 'AGENT_PRESET_FALLBACK_INJECTION'],
   'prompt-context-literal': ['PROMPT_CONTEXT_LITERAL_ANCHOR', 'PROMPT_CONTEXT_LITERAL_INJECTION'],
-  'fallback-heal-isolation': ['FALLBACK_HEAL_LOOP_OLD', 'FALLBACK_HEAL_LOOP_NEW'],
   'credentials-initial-retry': ['CREDENTIALS_LOAD_INITIAL_OLD', 'CREDENTIALS_LOAD_INITIAL_NEW'],
   'credentials-absent-guidance': ['CREDENTIALS_ABSENT_OLD', 'CREDENTIALS_ABSENT_NEW'],
   'device-auth-guidance': ['DEVICE_AUTH_THROW_ANCHOR_V2', 'deviceAuthGuidanceBlock'],
@@ -102,6 +99,8 @@ const rootSpecs = PATCH_SPECS.filter((s) => s.kind === 'root');
 // 0.1.6 迁移（2026-09-15）：loader-tree-isolation 移出——其靶 cordis-plugin-loader
 // 已被上游收编进 vendor/dsh-kernel（@deepseek-ai/cordis-plugin-loader@1.0.3），
 // 转入离线闭包，故非闭包集合 6→5。
+// 0.2.0-rc.2 重靶：loader-tree-isolation 规格整体退役（1.0.5 自己逐条目隔离），
+// 集合仍为 5 条。
 const EXPECTED_NON_VENDORED = [
   'codex-local-bin-fallback',
   'pi-ai-4xx-dump',
@@ -110,20 +109,19 @@ const EXPECTED_NON_VENDORED = [
   'pi-ai-tool-schema-sanitize',
 ];
 
-// 44 = 43（上一基线）+ 1 项新增（released-v0-history-recovery：靶 dsh-session-format-v0-to-v1
-// 的 released-v0 准入清单扩容，带 RELEASED_V0_HISTORY_MARKER → 回滚策略 marker-excise，
-// 且属 npm-ci 可恢复的 node_modules 内文件，不引入回滚盲区）。
-// 45 = 44 + 1 项新增（pi-ai-responses-tool-name-sanitize：靶 @earendil-works/pi-ai 的
-// openai-responses-shared.js，带 marker → 同为 marker-excise 回滚 + npm-ci 可恢复，
-// 多点注入（6 落点）故列入 MULTI_SITE）。
-// 46 = 45 + 1 项新增（pi-ai-tool-name-wire：靶 @deepseek-ai/dsh-llm-pi-ai/lib/index.js
-// 的工具名 wire 中央收口，带 marker → marker-excise 回滚 + npm-ci 可恢复，三处注入
-// （toolsOf 出站 + 回程两处 tool-call）故列入 MULTI_SITE）。
-// 47 = 46 + 1 项新增（pi-ai-quota-not-retryable：靶 @earendil-works/pi-ai/dist/utils/
-// provider-retry.js 的 isRetryableProviderError，注入 helper + 配额判定，
-// 带 marker → marker-excise 回滚 + npm-ci 可恢复）。
-test('审计 1：分类覆盖全部 47 个 file transform（无回滚盲区）', () => {
-  assert.equal(fileSpecs.length, 47);
+// —— file 型规格数沿革（只记变化量）——
+// 41→47（0.6.2→0.6.4 逐条新增 conversation-assembly-resilience /
+//   released-v0-history-recovery / pi-ai-responses-tool-name-sanitize /
+//   pi-ai-tool-name-wire / pi-ai-quota-not-retryable）。
+// 44 = 47（上一基线）− 3 项退役（0.2.0-rc.2 重靶）：
+//   · loader-tree-isolation —— 靶 cordis-plugin-loader 1.0.5 自己逐条目隔离，插入点消失；
+//   · settings-section-guard —— `this.register(ns, schema, {` 调用点全内核 0 命中；
+//   · fallback-heal-isolation —— rc.2 的 heal 回环原生逐名 try/catch。
+// 退役三条都带 marker 或 FROM/TO 对，不新增回滚盲区；npm-ci 可恢复面不变
+// （靶全在 node_modules 内）。root 侧同批退役 atomic-write-orphan-lock /
+// model-image-input / profile-bundle-guard-profileboot，见审计 3。
+test('审计 1：分类覆盖全部 44 个 file transform（无回滚盲区）', () => {
+  assert.equal(fileSpecs.length, 44);
   const report = [];
   for (const spec of fileSpecs) {
     const pair = INVERSE_PAIR_HINTS[spec.id];
@@ -167,7 +165,7 @@ test('审计 2：带 marker 的 transform，其 changed 产物含 marker（回�
   for (const line of honestSkip) console.log('  SKIP ' + line);
 });
 
-test('审计 5：诚实跳过集合恰为已知 6 条非闭包 marker transform（防静默停摆）', () => {
+test('审计 5：诚实跳过集合恰为已知 5 条非闭包 marker transform（防静默停摆）', () => {
   const actual = fileSpecs.filter((s) => s.marker && !specTargetVendored(s)).map((s) => s.id).sort();
   assert.deepEqual(actual, [...EXPECTED_NON_VENDORED].sort(),
     `非闭包（诚实 SKIP）集合漂移：实际=[${actual}]，基线=[${EXPECTED_NON_VENDORED}]。`
@@ -175,9 +173,9 @@ test('审计 5：诚实跳过集合恰为已知 6 条非闭包 marker transform�
 });
 
 test('审计 3：root 应用器只碰 node_modules（npm ci 整体可恢复）', () => {
-  // 17 = 16（旧基线）+ model-image-input（模型卡「支持图片输入」勾选，同靶
-  // dsh-client-ui-settings-models 的另一区段，仍只写 nm-roots 三棵树）。
-  assert.equal(rootSpecs.length, 17);
+  // 15 = 17（上一基线）− atomic-write-orphan-lock（上游原生 takeOverExitedLock）
+  // − model-image-input（上游原生 inputModalities），两条 rootAppliers 接线同批摘除。
+  assert.equal(rootSpecs.length, 15);
   for (const spec of rootSpecs) {
     assert.equal(spec.layout, 'nm-roots', `${spec.id} 应为 nm-roots 布局`);
     assert.equal(spec.wslLayout, 'nm-roots', `${spec.id} WSL 布局也应为 nm-roots`);

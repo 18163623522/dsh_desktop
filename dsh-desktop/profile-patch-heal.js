@@ -61,6 +61,12 @@ function parseFailedLoaderIds(text) {
 /**
  * 只读自愈预检：日志含「declares no dsh.bundle」形态时，返回经文件系统二次
  * 确认的坏 bundle 名单。绝不含 @deepseek-ai/*。
+ * ⚠ 0.2.0-rc.2 起这类 bundle 契约缺失不再击穿启动：内核 loadProfileDirectory
+ * 逐 bundle try/catch，只往 stderr 打一行 `skipping profile bundle "X": Error:
+ * dsh: profile bundle "X" declares no dsh.bundle in its package.json`（正则照样
+ * 命中这行嵌套文本）。于是本预检的触发前提（boot 失败）变稀——插件静默不加载而
+ * 应用照常起来，主路径因此是不依赖日志的 manifest 直扫 scanBundleContracts，
+ * 本函数保留为「boot 真失败且日志留痕」时的兜底。
  * @param {string} profileDir profile 目录
  * @param {string} logText dsh-web.log 尾部文本
  * @param {object} [fs] 文件系统实现（默认 node:fs）

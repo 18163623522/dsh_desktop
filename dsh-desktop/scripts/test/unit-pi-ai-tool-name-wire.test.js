@@ -15,6 +15,7 @@ const DSH = path.resolve(__dirname, '..', '..');
 const {
   transformPiAiToolNameWire,
   MARKER,
+  ANCHORS,
   patchSource,
 } = require('../patch-pi-ai-tool-name-wire');
 const { DSH_LLM_PIAI_PKG_REL } = require('../lib/patch-target-resolver');
@@ -57,9 +58,14 @@ test('幂等 already；任一锚点缺失整份不改（防半投）', () => {
   const p = pristineSource();
   const once = transformPiAiToolNameWire(p.src, p.file);
   assert.equal(transformPiAiToolNameWire(once.src, p.file).status, 'already');
-  // 直接破坏一个真实锚点：pristine 的出站是 `name: tool.name,`，改掉它即该锚失配。
-  const broken = p.src.replace('function toolsOf(options) {\n\treturn options.tools?.map((tool) => ({\n\t\tname: tool.name,',
-    'function toolsOf(options) {\n\treturn options.tools?.map((tool) => ({\n\t\tname: tool?.name,');
+  // 直接破坏一个真实锚点。必须按引用取生产 ANCHORS 的 needle 再改一个字符——
+  // 手抄一份「function toolsOf(options) { + return + name:」三行字面串曾在 rc.2
+  // 上静默失配（上游在 toolsOf 开头插了 deferLoading 守卫），replace 变 no-op，
+  // 于是这条反证根本没破坏任何东西。
+  const outbound = ANCHORS.find((a) => a.id === 'toolsOf-outbound');
+  const mangled = outbound.needle.replace('name: tool.name,', 'name: tool?.name,');
+  assert.notEqual(mangled, outbound.needle, '构造失败：needle 里不含可破坏的 name: tool.name, 片段');
+  const broken = p.src.replace(outbound.needle, mangled);
   assert.notEqual(broken, p.src, '构造失败：出站锚点未被破坏');
   const r = transformPiAiToolNameWire(broken, p.file);
   assert.equal(r.status, 'anchor-missing', '锚点失配必须判失配而非半投');
